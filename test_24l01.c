@@ -171,8 +171,8 @@ bzero(uint8_t *buf, uint32_t len)
   Then read out the TLC5940 status register and check that DC is correct.
 */
 static void
-ssi_cmd(uint32_t ssi_base, uint8_t *recvbuf, const uint8_t *sendbuf,
-        uint32_t len, uint32_t csn_base, uint32_t csn_pin)
+ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
+        uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
 {
   uint32_t i;
   uint32_t data;
@@ -192,6 +192,7 @@ ssi_cmd(uint32_t ssi_base, uint8_t *recvbuf, const uint8_t *sendbuf,
   /* Take CSN high to complete transfer. */
   ROM_GPIOPinWrite(csn_base, csn_pin, csn_pin);
 
+#ifdef SSI_DEBUG_OUTPUT
   /* For debug, output the data sent and received. */
   serial_output_str("Tx: ");
   for (i = 0; i < len; ++i)
@@ -208,13 +209,60 @@ ssi_cmd(uint32_t ssi_base, uint8_t *recvbuf, const uint8_t *sendbuf,
       serial_output_str(" ");
   }
   serial_output_str("\r\n");
+#endif
+}
+
+
+static void
+nrf_write_reg_n(uint8_t reg, uint8_t *data, uint32_t len,
+                uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t sendbuf[6], recvbuf[6];
+  if (len > 5)
+    len = 5;
+  sendbuf[0] = nRF_W_REGISTER | reg;
+  memcpy(&sendbuf[1], data, len);
+  ssi_cmd(recvbuf, sendbuf, len+1, ssi_base, csn_base, csn_pin);
+}
+
+
+static void
+nrf_write_reg(uint8_t reg, uint8_t val,
+              uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  nrf_write_reg_n(reg, &val, 1, ssi_base, csn_base, csn_pin);
+}
+
+
+static void
+nrf_read_reg_n(uint8_t reg, uint8_t *out, uint32_t len,
+               uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t sendbuf[6];
+  if (len > 5)
+    len = 5;
+  sendbuf[0] = nRF_R_REGISTER | reg;
+  bzero(&sendbuf[1], len);
+  ssi_cmd(out, sendbuf, len+1, ssi_base, csn_base, csn_pin);
+}
+
+
+static uint8_t
+nrf_read_reg(uint8_t reg, uint8_t *status_ptr,
+             uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t recvbuf[2];
+  nrf_read_reg_n(reg, recvbuf, 2, ssi_base, csn_base, csn_pin);
+  if (status_ptr)
+    *status_ptr = recvbuf[0];
+  return recvbuf[1];
 }
 
 
 int main()
 {
-  uint8_t recvbuf[32];
-  uint8_t sendbuf[32];
+  uint8_t status;
+  uint8_t val;
 
   /* Use the full 80MHz system clock. */
   ROM_SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL |
@@ -237,24 +285,29 @@ int main()
   /* nRF24L01+ datasheet says to wait 100msec for bootup. */
   ROM_SysCtlDelay(MCU_HZ/3/10);
 
-  serial_output_str("Write CONFIG Tx...\r\n");
-  sendbuf[0] = nRF_W_REGISTER | nRF_CONFIG;
-  sendbuf[1] = nRF_MASK_RX_DR|nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP;
-  ssi_cmd(SSI0_BASE, recvbuf, sendbuf, 2, GPIO_PORTA_BASE, GPIO_PIN_3);
-  serial_output_str("Read CONFIG Tx...\r\n");
-  bzero(sendbuf, 2);
-  sendbuf[0] = nRF_R_REGISTER | nRF_CONFIG;
-  ssi_cmd(SSI0_BASE, recvbuf, sendbuf, 2, GPIO_PORTA_BASE, GPIO_PIN_3);
+  serial_output_str("Tx: Write CONFIG...\r\n");
+  nrf_write_reg(nRF_CONFIG,
+                nRF_MASK_RX_DR|nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
+                SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3);
+  serial_output_str("Tx: Read CONFIG=0x");
+  val = nrf_read_reg(nRF_CONFIG, &status,
+                     SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3);
+  serial_output_hexbyte(val);
+  serial_output_str(" status=0x");
+  serial_output_hexbyte(status);
+  serial_output_str("\r\n");
 
-  serial_output_str("Write CONFIG Rx...\r\n");
-  sendbuf[0] = nRF_W_REGISTER | nRF_CONFIG;
-  sendbuf[1] = nRF_MASK_TX_DS|nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP;
-  ssi_cmd(SSI1_BASE, recvbuf, sendbuf, 2, GPIO_PORTF_BASE, GPIO_PIN_3);
-  serial_output_str("Read CONFIG Rx...\r\n");
-  bzero(sendbuf, 2);
-  sendbuf[0] = nRF_R_REGISTER | nRF_CONFIG;
-  ssi_cmd(SSI1_BASE, recvbuf, sendbuf, 2, GPIO_PORTF_BASE, GPIO_PIN_3);
-
+  serial_output_str("Rx: Write CONFIG...\r\n");
+  nrf_write_reg(nRF_CONFIG,
+                nRF_MASK_TX_DS|nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
+                SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
+  serial_output_str("Rx: Read CONFIG=0x");
+  val = nrf_read_reg(nRF_CONFIG, &status,
+                     SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
+  serial_output_hexbyte(val);
+  serial_output_str(" status=0x");
+  serial_output_hexbyte(status);
+  serial_output_str("\r\n");
   serial_output_str("Done!\r\n");
 
   for(;;)
