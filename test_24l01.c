@@ -166,6 +166,34 @@ bzero(uint8_t *buf, uint32_t len)
 }
 
 
+static inline void
+csn_low(uint32_t csn_base, uint32_t csn_pin)
+{
+  ROM_GPIOPinWrite(csn_base, csn_pin, 0);
+}
+
+
+static inline void
+csn_high(uint32_t csn_base, uint32_t csn_pin)
+{
+  ROM_GPIOPinWrite(csn_base, csn_pin, csn_pin);
+}
+
+
+static inline void
+ce_low(uint32_t ce_base, uint32_t ce_pin)
+{
+  ROM_GPIOPinWrite(ce_base, ce_pin, 0);
+}
+
+
+static inline void
+ce_high(uint32_t ce_base, uint32_t ce_pin)
+{
+  ROM_GPIOPinWrite(ce_base, ce_pin, ce_pin);
+}
+
+
 /*
   Set the DC register on TLC5940 through SSI.
   Then read out the TLC5940 status register and check that DC is correct.
@@ -178,7 +206,7 @@ ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
   uint32_t data;
 
   /* Take CSN low to initiate transfer. */
-  ROM_GPIOPinWrite(csn_base, csn_pin, 0);
+  csn_low(csn_base, csn_pin);
 
   for (i = 0; i < len; ++i)
   {
@@ -190,7 +218,7 @@ ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
   }
 
   /* Take CSN high to complete transfer. */
-  ROM_GPIOPinWrite(csn_base, csn_pin, csn_pin);
+  csn_high(csn_base, csn_pin);
 
 #ifdef SSI_DEBUG_OUTPUT
   /* For debug, output the data sent and received. */
@@ -210,6 +238,53 @@ ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
   }
   serial_output_str("\r\n");
 #endif
+}
+
+
+static void
+nrf_rx(uint8_t *data, uint32_t len,
+       uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t sendbuf[33], recvbuf[33];
+
+  if (len > 32)
+    len = 32;
+  sendbuf[0] = nRF_R_RX_PAYLOAD;
+  bzero(&sendbuf[1], len);
+  ssi_cmd(recvbuf, sendbuf, len+1, ssi_base, csn_base, csn_pin);
+  memcpy(data, &recvbuf[1], len);
+}
+
+
+static void
+nrf_tx_nack(uint8_t *data, uint32_t len,
+            uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t sendbuf[33], recvbuf[33];
+
+  if (len > 32)
+    len = 32;
+  sendbuf[0] = nRF_W_TX_PAYLOAD_NOACK;
+  memcpy(&sendbuf[1], data, len);
+  ssi_cmd(recvbuf, sendbuf, len+1, ssi_base, csn_base, csn_pin);
+}
+
+
+static void
+nrf_flush_tx(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t cmd = nRF_FLUSH_TX;
+  uint8_t status;
+  ssi_cmd(&status, &cmd, 1, ssi_base, csn_base, csn_pin);
+}
+
+
+static void
+nrf_flush_rx(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t cmd = nRF_FLUSH_RX;
+  uint8_t status;
+  ssi_cmd(&status, &cmd, 1, ssi_base, csn_base, csn_pin);
 }
 
 
@@ -271,12 +346,12 @@ nrf_init_config(uint8_t is_rx, uint32_t channel, uint32_t power,
   static const uint8_t addr[3] = { 0xe7, 0xe7, 0xe7 };
 
   if (is_rx)
-    nrf_write_reg(nRF_CONFIG,
-                  nRF_MASK_TX_DS|nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
+    nrf_write_reg(nRF_CONFIG, nRF_PRIM_RX | nRF_MASK_TX_DS |
+                  nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
                   ssi_base, csn_base, csn_pin);
   else
-    nrf_write_reg(nRF_CONFIG,
-                  nRF_MASK_RX_DR|nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
+    nrf_write_reg(nRF_CONFIG, nRF_MASK_RX_DR |
+                  nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
                   ssi_base, csn_base, csn_pin);
   /* Disable auto-ack, saving 9 bits/packet. Else 0x3f. */
   nrf_write_reg(nRF_EN_AA, 0, ssi_base, csn_base, csn_pin);
@@ -303,6 +378,67 @@ nrf_init_config(uint8_t is_rx, uint32_t channel, uint32_t power,
   nrf_write_reg(nRF_DYNDP, 0, ssi_base, csn_base, csn_pin);
   /* Allow disabling acks. */
   nrf_write_reg(nRF_FEATURE, nRF_EN_DYN_ACK, ssi_base, csn_base, csn_pin);
+
+  /* Clear out all FIFOs. */
+  nrf_flush_tx(ssi_base, csn_base, csn_pin);
+  nrf_flush_rx(ssi_base, csn_base, csn_pin);
+  /* Clear the IRQ bits in STATUS register. */
+  nrf_write_reg(nRF_STATUS, nRF_RX_DR|nRF_TX_DS|nRF_MAX_RT,
+                ssi_base, csn_base, csn_pin);
+}
+
+
+static void
+transmit_packet(uint8_t startval,
+                uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin,
+                uint32_t ce_base, uint32_t ce_pin)
+{
+  uint8_t buf[32];
+  uint32_t i;
+
+  for (i = 0; i < 32; ++i)
+    buf[i] = startval + i;
+  nrf_tx_nack(buf, 32, ssi_base, csn_base, csn_pin);
+  ce_high(ce_base, ce_pin);
+  for (;;)
+  {
+    uint8_t status;
+
+    nrf_read_reg(nRF_FIFO_STATUS, &status, ssi_base, csn_base, csn_pin);
+    if (status & nRF_TX_DS)
+      break;
+  }
+  ce_low(ce_base, ce_pin);
+}
+
+
+static void
+receive_packet(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin,
+               uint32_t ce_base, uint32_t ce_pin)
+{
+  uint8_t buf[32];
+  uint32_t i;
+  uint8_t fifo_status;
+  uint8_t status;
+
+  for (;;)
+  {
+    fifo_status = nrf_read_reg(nRF_FIFO_STATUS, &status,
+                               ssi_base, csn_base, csn_pin);
+    if (status & nRF_RX_DR)
+      break;
+  }
+  serial_output_str("Rx status=0x");
+  serial_output_hexbyte(status);
+  serial_output_str(" fifo_status=0x");
+  serial_output_hexbyte(fifo_status);
+  serial_output_str("\r\n");
+
+  nrf_rx(buf, 32, ssi_base, csn_base, csn_pin);
+  serial_output_str("Rx packet: ");
+  for (i = 0; i < 32; ++i)
+    serial_output_hexbyte(buf[i]);
+  serial_output_str("\r\n");
 }
 
 
@@ -354,6 +490,19 @@ int main()
   serial_output_hexbyte(status);
   serial_output_str("\r\n");
   serial_output_str("Done!\r\n");
+
+  /* Set Rx in receive mode. */
+  ce_high(GPIO_PORTB_BASE, GPIO_PIN_0);
+  /* Wait a bit to make sure Rx is ready. */
+  ROM_SysCtlDelay(MCU_HZ/3/100);
+
+  transmit_packet(42, SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3,
+                  GPIO_PORTA_BASE, GPIO_PIN_6);
+  serial_output_str("Tx: Sent packet\r\n");
+
+  serial_output_str("Rx: Waiting for packet...\r\n");
+  receive_packet(SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3,
+                 GPIO_PORTB_BASE, GPIO_PIN_0);
 
   for(;;)
     ;
