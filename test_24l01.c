@@ -214,7 +214,7 @@ ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
 
 
 static void
-nrf_write_reg_n(uint8_t reg, uint8_t *data, uint32_t len,
+nrf_write_reg_n(uint8_t reg, const uint8_t *data, uint32_t len,
                 uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
 {
   uint8_t sendbuf[6], recvbuf[6];
@@ -259,6 +259,53 @@ nrf_read_reg(uint8_t reg, uint8_t *status_ptr,
 }
 
 
+/*
+  Configure nRF24L01+ as Rx or Tx.
+    channel - radio frequency channel to use, 0 <= channel <= 127.
+    power - nRF_RF_PWR_<X>DBM, <X> is 0, 6, 12, 18 dBm.
+*/
+static void
+nrf_init_config(uint8_t is_rx, uint32_t channel, uint32_t power,
+                uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  static const uint8_t addr[3] = { 0xe7, 0xe7, 0xe7 };
+
+  if (is_rx)
+    nrf_write_reg(nRF_CONFIG,
+                  nRF_MASK_TX_DS|nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
+                  ssi_base, csn_base, csn_pin);
+  else
+    nrf_write_reg(nRF_CONFIG,
+                  nRF_MASK_RX_DR|nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
+                  ssi_base, csn_base, csn_pin);
+  /* Disable auto-ack, saving 9 bits/packet. Else 0x3f. */
+  nrf_write_reg(nRF_EN_AA, 0, ssi_base, csn_base, csn_pin);
+  /* Enable only pipe 0. */
+  nrf_write_reg(nRF_EN_RXADDR, nRF_ERX_P0, ssi_base, csn_base, csn_pin);
+  /* 3 byte adresses. */
+  nrf_write_reg(nRF_SETUP_AW, nRF_AW_3BYTES, ssi_base, csn_base, csn_pin);
+  /* Disable auto retransmit. */
+  nrf_write_reg(nRF_SETUP_RETR, 0, ssi_base, csn_base, csn_pin);
+  nrf_write_reg(nRF_RF_CH, channel, ssi_base, csn_base, csn_pin);
+  /* Use 2Mbps, and set transmit power. */
+  nrf_write_reg(nRF_RF_SETUP, nRF_RF_DR_HIGH | power,
+                ssi_base, csn_base, csn_pin);
+  nrf_write_reg_n(nRF_RX_ADDR_P0, addr, 3, ssi_base, csn_base, csn_pin);
+  nrf_write_reg_n(nRF_TX_ADDR, addr, 3, ssi_base, csn_base, csn_pin);
+  /* Set payload size for pipe 0. */
+  if (is_rx)
+    nrf_write_reg(nRF_RX_PW_P0, 32, ssi_base, csn_base, csn_pin);
+  else
+    nrf_write_reg(nRF_RX_PW_P0, 8, ssi_base, csn_base, csn_pin);
+  /* Disable pipe 1-5. */
+  nrf_write_reg(nRF_RX_PW_P1, 0, ssi_base, csn_base, csn_pin);
+  /* Disable dynamic payload length. */
+  nrf_write_reg(nRF_DYNDP, 0, ssi_base, csn_base, csn_pin);
+  /* Allow disabling acks. */
+  nrf_write_reg(nRF_FEATURE, nRF_EN_DYN_ACK, ssi_base, csn_base, csn_pin);
+}
+
+
 int main()
 {
   uint8_t status;
@@ -285,10 +332,9 @@ int main()
   /* nRF24L01+ datasheet says to wait 100msec for bootup. */
   ROM_SysCtlDelay(MCU_HZ/3/10);
 
-  serial_output_str("Tx: Write CONFIG...\r\n");
-  nrf_write_reg(nRF_CONFIG,
-                nRF_MASK_RX_DR|nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
-                SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3);
+  serial_output_str("Tx: Setting up...\r\n");
+  nrf_init_config(0 /* Tx */, 2, nRF_RF_PWR_18DBM,
+                  SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3);
   serial_output_str("Tx: Read CONFIG=0x");
   val = nrf_read_reg(nRF_CONFIG, &status,
                      SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3);
@@ -297,10 +343,9 @@ int main()
   serial_output_hexbyte(status);
   serial_output_str("\r\n");
 
-  serial_output_str("Rx: Write CONFIG...\r\n");
-  nrf_write_reg(nRF_CONFIG,
-                nRF_MASK_TX_DS|nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP,
-                SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
+  serial_output_str("Rx: Setting up...\r\n");
+  nrf_init_config(1 /* Rx */, 2, nRF_RF_PWR_18DBM,
+                  SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
   serial_output_str("Rx: Read CONFIG=0x");
   val = nrf_read_reg(nRF_CONFIG, &status,
                      SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);

@@ -54,9 +54,9 @@
 #define nRF_PLL_LOCK (1<<4)
 #define nRF_RF_DR_HIGH (1<<3)
 #define nRF_RF_PWR_0DBM (3<<1)
-#define nRF_RF_PWR_8DBM (2<<1)
-#define nRF_RF_PWR_16DBM (1<<1)
-#define nRF_RF_PWR_24DBM (0<<1)
+#define nRF_RF_PWR_6DBM (2<<1)
+#define nRF_RF_PWR_12DBM (1<<1)
+#define nRF_RF_PWR_18DBM (0<<1)
 
 #define nRF_STATUS 7
 #define nRF_RX_DR (1<<6)
@@ -103,4 +103,4 @@
 #define nRF_FEATURE 0x1d
 #define nRF_EN_DPL (1<<2)
 #define nRF_EN_ACK_PAY (1<<1)
-#define nRF_EN_DYN_ACK (1<<0A)
+#define nRF_EN_DYN_ACK (1<<0)
