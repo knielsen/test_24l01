@@ -20,12 +20,21 @@
 /*
   nRF24L01 pinout:
 
-    PF2  SCK                            GND *1 2. VCC
-    PF3  CSN                            PB0 .3 4. PF3
-    PF0  MISO                           PF2 .5 6. PF1
-    PF1  MOSI                           PF0 .7 8. PF4
+  Rx:
+    PF2  SCK        GND *1 2. VCC
+    PF3  CSN        PB0 .3 4. PF3
+    PF0  MISO       PF2 .5 6. PF1
+    PF1  MOSI       PF0 .7 8. PF4
     PB0  CE
     PF4  IRQ
+
+  Tx:
+    PA2  SCK        GND *1 2. VCC
+    PA3  CSN        PA6 .3 4. PA3
+    PA4  MISO       PA2 .5 6. PA5
+    PA5  MOSI       PA4 .7 8. PA7
+    PA6  CE
+    PA7  IRQ
 */
 
 
@@ -106,6 +115,22 @@ config_ssi_gpio(void)
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
   ROM_GPIOPinTypeGPIOOutput(GPIO_PORTB_BASE, GPIO_PIN_0);
   ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_0, 0);
+
+  /* Config Tx on SSI0, PA2-PA7 */
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_SSI0);
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+
+  ROM_GPIOPinConfigure(GPIO_PA2_SSI0CLK);
+  ROM_GPIOPinConfigure(GPIO_PA4_SSI0RX);
+  ROM_GPIOPinConfigure(GPIO_PA5_SSI0TX);
+  ROM_GPIOPinTypeSSI(GPIO_PORTA_BASE, GPIO_PIN_2 | GPIO_PIN_4 | GPIO_PIN_5);
+  /* CSN pin, high initially */
+  ROM_GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, GPIO_PIN_3);
+  ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_3, GPIO_PIN_3);
+  /* CE pin, low initially */
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+  ROM_GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, GPIO_PIN_6);
+  ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_6, 0);
 }
 
 
@@ -147,13 +172,13 @@ bzero(uint8_t *buf, uint32_t len)
 */
 static void
 ssi_cmd(uint32_t ssi_base, uint8_t *recvbuf, const uint8_t *sendbuf,
-        uint32_t len)
+        uint32_t len, uint32_t csn_base, uint32_t csn_pin)
 {
   uint32_t i;
   uint32_t data;
 
   /* Take CSN low to initiate transfer. */
-  ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_3, 0);
+  ROM_GPIOPinWrite(csn_base, csn_pin, 0);
 
   for (i = 0; i < len; ++i)
   {
@@ -165,7 +190,7 @@ ssi_cmd(uint32_t ssi_base, uint8_t *recvbuf, const uint8_t *sendbuf,
   }
 
   /* Take CSN high to complete transfer. */
-  ROM_GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_3, GPIO_PIN_3);
+  ROM_GPIOPinWrite(csn_base, csn_pin, csn_pin);
 
   /* For debug, output the data sent and received. */
   serial_output_str("Tx: ");
@@ -206,18 +231,30 @@ int main()
                        UART_CONFIG_PAR_NONE));
 
   config_ssi_gpio();
+  config_spi(SSI0_BASE);
   config_spi(SSI1_BASE);
 
   /* nRF24L01+ datasheet says to wait 100msec for bootup. */
   ROM_SysCtlDelay(MCU_HZ/3/10);
-  serial_output_str("Write CONFIG...\r\n");
+
+  serial_output_str("Write CONFIG Tx...\r\n");
   sendbuf[0] = nRF_W_REGISTER | nRF_CONFIG;
   sendbuf[1] = nRF_MASK_RX_DR|nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP;
-  ssi_cmd(SSI1_BASE, recvbuf, sendbuf, 2);
-  serial_output_str("Read CONFIG...\r\n");
+  ssi_cmd(SSI0_BASE, recvbuf, sendbuf, 2, GPIO_PORTA_BASE, GPIO_PIN_3);
+  serial_output_str("Read CONFIG Tx...\r\n");
   bzero(sendbuf, 2);
   sendbuf[0] = nRF_R_REGISTER | nRF_CONFIG;
-  ssi_cmd(SSI1_BASE, recvbuf, sendbuf, 2);
+  ssi_cmd(SSI0_BASE, recvbuf, sendbuf, 2, GPIO_PORTA_BASE, GPIO_PIN_3);
+
+  serial_output_str("Write CONFIG Rx...\r\n");
+  sendbuf[0] = nRF_W_REGISTER | nRF_CONFIG;
+  sendbuf[1] = nRF_MASK_TX_DS|nRF_MASK_MAX_RT|nRF_EN_CRC|nRF_CRCO|nRF_PWR_UP;
+  ssi_cmd(SSI1_BASE, recvbuf, sendbuf, 2, GPIO_PORTF_BASE, GPIO_PIN_3);
+  serial_output_str("Read CONFIG Rx...\r\n");
+  bzero(sendbuf, 2);
+  sendbuf[0] = nRF_R_REGISTER | nRF_CONFIG;
+  ssi_cmd(SSI1_BASE, recvbuf, sendbuf, 2, GPIO_PORTF_BASE, GPIO_PIN_3);
+
   serial_output_str("Done!\r\n");
 
   for(;;)
