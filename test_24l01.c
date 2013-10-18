@@ -395,6 +395,59 @@ nrf_init_config(uint8_t is_rx, uint32_t channel, uint32_t power,
 
 
 static void
+config_interrupts(void)
+{
+  ROM_GPIOIntTypeSet(GPIO_PORTA_BASE, GPIO_PIN_7, GPIO_LOW_LEVEL);
+  ROM_GPIOPinIntEnable(GPIO_PORTA_BASE, GPIO_PIN_7);
+  ROM_GPIOIntTypeSet(GPIO_PORTF_BASE, GPIO_PIN_4, GPIO_LOW_LEVEL);
+  ROM_GPIOPinIntEnable(GPIO_PORTF_BASE, GPIO_PIN_4);
+  ROM_IntMasterEnable();
+  ROM_IntEnable(INT_GPIOA);
+  ROM_IntEnable(INT_GPIOF);
+}
+
+
+void
+IntHandlerGPIOa(void)
+{
+  uint32_t irq_status = HWREG(GPIO_PORTA_BASE + GPIO_O_MIS) & 0xff;
+  if (irq_status & GPIO_PIN_7)
+  {
+    /* Tx IRQ. */
+
+    /*
+      Clear the interrupt request and disable further interrupts until we can
+      clear the request from the device over SPI.
+    */
+    HWREG(GPIO_PORTA_BASE + GPIO_O_IM) &= ~GPIO_PIN_7 & 0xff;
+    HWREG(GPIO_PORTA_BASE + GPIO_O_ICR) = GPIO_PIN_7;
+
+    serial_output_str("Tx: IRQ: TX_DS\r\n");
+  }
+}
+
+
+void
+IntHandlerGPIOf(void)
+{
+  uint32_t irq_status = HWREG(GPIO_PORTF_BASE + GPIO_O_MIS) & 0xff;
+  if (irq_status & GPIO_PIN_4)
+  {
+    /* Rx IRQ. */
+
+    /*
+      Clear the interrupt request and disable further interrupts until we can
+      clear the request from the device over SPI.
+    */
+    HWREG(GPIO_PORTF_BASE + GPIO_O_IM) &= ~GPIO_PIN_4 & 0xff;
+    HWREG(GPIO_PORTF_BASE + GPIO_O_ICR) = GPIO_PIN_4;
+
+    serial_output_str("Rx: IRQ: RX_DR\r\n");
+  }
+}
+
+
+static void
 transmit_packet(uint8_t startval,
                 uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin,
                 uint32_t ce_base, uint32_t ce_pin)
@@ -442,6 +495,7 @@ int main()
   /* Use the full 80MHz system clock. */
   ROM_SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL |
                      SYSCTL_OSC_MAIN | SYSCTL_XTAL_16MHZ);
+  ROM_FPULazyStackingEnable();
 
   /* Configure serial. */
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
@@ -461,6 +515,7 @@ int main()
   ROM_SysCtlDelay(MCU_HZ/3/10);
 
   serial_output_str("Tx: Setting up...\r\n");
+  config_interrupts();
   nrf_init_config(0 /* Tx */, 2, nRF_RF_PWR_18DBM,
                   SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3);
   serial_output_str("Tx: Read CONFIG=0x");
