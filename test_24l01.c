@@ -115,6 +115,9 @@ config_ssi_gpio(void)
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
   ROM_GPIOPinTypeGPIOOutput(GPIO_PORTB_BASE, GPIO_PIN_0);
   ROM_GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_0, 0);
+  /* IRQ pin as input. */
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+  ROM_GPIOPinTypeGPIOInput(GPIO_PORTF_BASE, GPIO_PIN_4);
 
   /* Config Tx on SSI0, PA2-PA7 */
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_SSI0);
@@ -131,6 +134,9 @@ config_ssi_gpio(void)
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
   ROM_GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, GPIO_PIN_6);
   ROM_GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_6, 0);
+  /* IRQ pin as input. */
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+  ROM_GPIOPinTypeGPIOInput(GPIO_PORTA_BASE, GPIO_PIN_7);
 }
 
 
@@ -400,15 +406,11 @@ transmit_packet(uint8_t startval,
     buf[i] = startval + i;
   nrf_tx_nack(buf, 32, ssi_base, csn_base, csn_pin);
   ce_high(ce_base, ce_pin);
-  for (;;)
-  {
-    uint8_t status;
 
-    nrf_read_reg(nRF_FIFO_STATUS, &status, ssi_base, csn_base, csn_pin);
-    if (status & nRF_TX_DS)
-      break;
-  }
+  while (ROM_GPIOPinRead(GPIO_PORTA_BASE, GPIO_PIN_7))
+    ;
   ce_low(ce_base, ce_pin);
+  nrf_write_reg(nRF_STATUS, nRF_TX_DS, ssi_base, csn_base, csn_pin);
 }
 
 
@@ -418,23 +420,13 @@ receive_packet(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin,
 {
   uint8_t buf[32];
   uint32_t i;
-  uint8_t fifo_status;
-  uint8_t status;
 
-  for (;;)
-  {
-    fifo_status = nrf_read_reg(nRF_FIFO_STATUS, &status,
-                               ssi_base, csn_base, csn_pin);
-    if (status & nRF_RX_DR)
-      break;
-  }
-  serial_output_str("Rx status=0x");
-  serial_output_hexbyte(status);
-  serial_output_str(" fifo_status=0x");
-  serial_output_hexbyte(fifo_status);
-  serial_output_str("\r\n");
+  while (ROM_GPIOPinRead(GPIO_PORTF_BASE, GPIO_PIN_4))
+    ;
 
   nrf_rx(buf, 32, ssi_base, csn_base, csn_pin);
+  nrf_write_reg(nRF_STATUS, nRF_RX_DR, ssi_base, csn_base, csn_pin);
+
   serial_output_str("Rx packet: ");
   for (i = 0; i < 32; ++i)
     serial_output_hexbyte(buf[i]);
