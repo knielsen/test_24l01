@@ -266,6 +266,7 @@ ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
 
 
 static volatile uint8_t ssi_udma_running = 0;
+static volatile uint8_t ssi_tx_active = 0;
 
 static void
 ssi_cmd_dma(uint8_t *sendbuf, uint32_t len, uint32_t csn_base, uint32_t csn_pin)
@@ -277,6 +278,7 @@ ssi_cmd_dma(uint8_t *sendbuf, uint32_t len, uint32_t csn_base, uint32_t csn_pin)
                              UDMA_MODE_BASIC, sendbuf,
                              (void *)(SSI0_BASE + SSI_O_DR), len);
   ssi_udma_running = 1;
+  ssi_tx_active = 1;
   ROM_uDMAChannelEnable(UDMA_CHANNEL_SSI0TX);
 }
 
@@ -286,7 +288,7 @@ ssi_dma_wait(uint32_t csn_base, uint32_t csn_pin)
 {
   while (ssi_udma_running)
     ;
-  while (ROM_SSIBusy(SSI0_BASE))
+  while (ssi_tx_active)
     ;
   /* Take CSN high to complete transfer. */
   csn_high(csn_base, csn_pin);
@@ -334,7 +336,6 @@ nrf_tx_nack_dma(uint8_t *data, uint32_t len,
   sendbuf[0] = nRF_W_TX_PAYLOAD_NOACK;
   memcpy(&sendbuf[1], data, len);
   ssi_cmd_dma(sendbuf, len+1, csn_base, csn_pin);
-  ssi_dma_wait(csn_base, csn_pin);
 }
 
 
@@ -514,8 +515,39 @@ IntHandlerSSI0(void)
 {
   uint32_t irq_status = ROM_SSIIntStatus(SSI0_BASE, 1);
   ROM_SSIIntClear(SSI0_BASE, irq_status);
-  if (!ROM_uDMAChannelIsEnabled(UDMA_CHANNEL_SSI0TX))
+  if (ssi_udma_running && !ROM_uDMAChannelIsEnabled(UDMA_CHANNEL_SSI0TX))
+  {
+    /* Dma completed. */
     ssi_udma_running = 0;
+    /*
+      Enable interrupt at end of transfer.
+
+      Things did not work for me unless I delayed setting EOT to here (rather
+      that doing it up-front). My guess is that setting EOT prevents not only
+      the interrupt at half-full fifo, but also the dma request, causing send
+      to stall, but I did not investigate fully.
+
+      Also, let's clear the TX interrupt, if not I seemed to get a spurious
+      interrupt, probably due to the fifo being half-full at this point.
+
+      Note that then I also need to check for EOT already now in this
+      interrupt activation, to avoid a race where EOT could have occured
+      already due to delayed interrupt execution.
+    */
+    HWREG(SSI0_BASE + SSI_O_CR1) |= SSI_CR1_EOT;
+    ROM_SSIIntClear(SSI0_BASE, SSI_TXFF);
+    HWREG(SSI0_BASE + SSI_O_IM) |= SSI_TXFF;
+  }
+  if (!ROM_SSIBusy(SSI0_BASE))
+  {
+    ssi_tx_active = 0;
+    /*
+      Now that the transfer is completely done, set the TX interrupt back
+      to disabled and trigger at 1/2 full fifo.
+    */
+    HWREG(SSI0_BASE + SSI_O_IM) &= ~SSI_TXFF;
+    HWREG(SSI0_BASE + SSI_O_CR1) &= ~SSI_CR1_EOT;
+  }
 }
 
 
@@ -537,6 +569,7 @@ transmit_packet(uint8_t startval,
   for (i = 0; i < 32; ++i)
     buf[i] = startval + i;
   nrf_tx_nack_dma(buf, 32, ssi_base, csn_base, csn_pin);
+  ssi_dma_wait(csn_base, csn_pin);
   ce_high(ce_base, ce_pin);
 
   while (ROM_GPIOPinRead(GPIO_PORTA_BASE, GPIO_PIN_7))
