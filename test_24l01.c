@@ -274,45 +274,104 @@ ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
 }
 
 
-static volatile uint8_t ssi_udma_rx_running = 0;
-static volatile uint8_t ssi_udma_tx_running = 0;
-static volatile uint8_t ssi_tx_active = 0;
+/*
+  Asynchronous SSI transfer to nRF24L01+ using uDMA.
+  Performs a transaction over SPI.
+  First call nrf_async_start(). While nrf_async_start() or nrf_async_cont()
+  returns zero, call nrf_async_cont() for each SSI interrupt event (either
+  signifying DMA or transfer done).
+*/
+struct nrf_async_dma {
+  uint32_t ssi_base;
+  uint32_t dma_rx_chan;
+  uint32_t dma_tx_chan;
+  uint32_t csn_base;
+  uint32_t csn_pin;
+  uint8_t dma_rx_running;
+  uint8_t dma_tx_running;
+  uint8_t ssi_active;
+};
 
-static void
-ssi_cmd_dma(uint8_t *recvbuf, uint8_t *sendbuf, uint32_t len,
-            uint32_t csn_base, uint32_t csn_pin)
+
+uint32_t
+nrf_async_dma_start(struct nrf_async_dma *a, uint8_t *recvbuf, uint8_t *sendbuf,
+                    uint32_t len, uint32_t ssi_base, uint32_t dma_rx_chan,
+                    uint32_t dma_tx_chan, uint32_t csn_base, uint32_t csn_pin)
 {
+  a->ssi_base = ssi_base;
+  a->dma_rx_chan = dma_rx_chan;
+  a->dma_tx_chan = dma_tx_chan;
+  a->csn_base = csn_base;
+  a->csn_pin = csn_pin;
+  ROM_uDMAChannelTransferSet(dma_rx_chan | UDMA_PRI_SELECT, UDMA_MODE_BASIC,
+                             (void *)(ssi_base + SSI_O_DR), recvbuf, len);
+  ROM_uDMAChannelTransferSet(dma_tx_chan | UDMA_PRI_SELECT, UDMA_MODE_BASIC,
+                             sendbuf, (void *)(ssi_base + SSI_O_DR), len);
+  a->dma_rx_running = 1;
+  a->dma_tx_running = 1;
+  a->ssi_active = 1;
   /* Take CSN low to initiate transfer. */
   csn_low(csn_base, csn_pin);
-
-  ROM_uDMAChannelTransferSet(UDMA_CHANNEL_SSI0RX | UDMA_PRI_SELECT,
-                             UDMA_MODE_BASIC, (void *)(SSI0_BASE + SSI_O_DR),
-                             recvbuf, len);
-  ROM_uDMAChannelTransferSet(UDMA_CHANNEL_SSI0TX | UDMA_PRI_SELECT,
-                             UDMA_MODE_BASIC, sendbuf,
-                             (void *)(SSI0_BASE + SSI_O_DR), len);
-  ssi_udma_rx_running = 1;
-  ssi_udma_tx_running = 1;
-  ssi_tx_active = 1;
   /* Empty any left-over stuff in the RX FIFO. */
-  while (HWREG(SSI0_BASE + SSI_O_SR) & SSI_SR_RNE)
-    (void)(HWREG(SSI0_BASE + SSI_O_DR));
-  ROM_uDMAChannelEnable(UDMA_CHANNEL_SSI0RX);
-  ROM_uDMAChannelEnable(UDMA_CHANNEL_SSI0TX);
+  while (HWREG(ssi_base + SSI_O_SR) & SSI_SR_RNE)
+    (void)(HWREG(ssi_base + SSI_O_DR));
+  ROM_uDMAChannelEnable(dma_rx_chan);
+  ROM_uDMAChannelEnable(dma_tx_chan);
+  return 0;
 }
 
 
-static void
-ssi_dma_wait(uint32_t csn_base, uint32_t csn_pin)
+uint32_t
+nrf_async_dma_cont(struct nrf_async_dma *a)
 {
-  while (ssi_udma_tx_running)
-    ;
-  while (ssi_tx_active)
-    ;
-  while (ssi_udma_rx_running)
-    ;
-  /* Take CSN high to complete transfer. */
-  csn_high(csn_base, csn_pin);
+  /*
+    There are no pending interrupt requests to clear here.
+    The only interrupt we handle is SSI_TXFF (TX FIFO empty), and that
+    cannot be cleared (except by putting stuff in the FIFO). Rather, we
+    unmask and mask it as appropriate.
+  */
+  if (a->dma_tx_running && !ROM_uDMAChannelIsEnabled(a->dma_tx_chan))
+  {
+    a->dma_tx_running = 0;
+    /*
+      Enable interrupt at end of transfer.
+
+      Things did not work for me unless I delayed setting EOT to here (rather
+      that doing it up-front). My guess is that setting EOT prevents not only
+      the interrupt at half-full fifo, but also the dma request, causing send
+      to stall, but I did not investigate fully.
+
+      Also, let's clear the TX interrupt, if not I seemed to get a spurious
+      interrupt, probably due to the fifo being half-full at this point.
+
+      Note that then I also need to check for EOT already now in this
+      interrupt activation, to avoid a race where EOT could have occured
+      already due to delayed interrupt execution.
+    */
+    HWREG(a->ssi_base + SSI_O_CR1) |= SSI_CR1_EOT;
+    ROM_SSIIntClear(a->ssi_base, SSI_TXFF);
+    HWREG(a->ssi_base + SSI_O_IM) |= SSI_TXFF;
+  }
+  if (!ROM_SSIBusy(a->ssi_base))
+  {
+    a->ssi_active = 0;
+    /*
+      Now that the transfer is completely done, set the TX interrupt back
+      to disabled and trigger at 1/2 full fifo.
+    */
+    HWREG(a->ssi_base + SSI_O_IM) &= ~SSI_TXFF;
+    HWREG(a->ssi_base + SSI_O_CR1) &= ~SSI_CR1_EOT;
+  }
+  if (a->dma_rx_running && !ROM_uDMAChannelIsEnabled(a->dma_rx_chan))
+    a->dma_rx_running = 0;
+  if (a->dma_tx_running || a->ssi_active || a->dma_rx_running)
+    return 0;
+  else
+  {
+    /* Take CSN high to complete transfer. */
+    csn_high(a->csn_base, a->csn_pin);
+    return 1;
+  }
 }
 
 
@@ -343,20 +402,6 @@ nrf_tx_nack(uint8_t *data, uint32_t len,
   sendbuf[0] = nRF_W_TX_PAYLOAD_NOACK;
   memcpy(&sendbuf[1], data, len);
   ssi_cmd(recvbuf, sendbuf, len+1, ssi_base, csn_base, csn_pin);
-}
-
-
-static void
-nrf_tx_nack_dma(uint8_t *recvbuf, uint8_t *data, uint32_t len,
-                uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
-{
-  uint8_t sendbuf[33];
-
-  if (len > 32)
-    len = 32;
-  sendbuf[0] = nRF_W_TX_PAYLOAD_NOACK;
-  memcpy(&sendbuf[1], data, len);
-  ssi_cmd_dma(recvbuf, sendbuf, len+1, csn_base, csn_pin);
 }
 
 
@@ -531,46 +576,14 @@ IntHandlerGPIOf(void)
 }
 
 
+struct nrf_async_dma transmit_packet_state;
+volatile uint8_t transmit_packet_running = 0;
+
 void
 IntHandlerSSI0(void)
 {
-  uint32_t irq_status = ROM_SSIIntStatus(SSI0_BASE, 1);
-  ROM_SSIIntClear(SSI0_BASE, irq_status);
-  if (ssi_udma_tx_running && !ROM_uDMAChannelIsEnabled(UDMA_CHANNEL_SSI0TX))
-  {
-    /* Dma completed. */
-    ssi_udma_tx_running = 0;
-    /*
-      Enable interrupt at end of transfer.
-
-      Things did not work for me unless I delayed setting EOT to here (rather
-      that doing it up-front). My guess is that setting EOT prevents not only
-      the interrupt at half-full fifo, but also the dma request, causing send
-      to stall, but I did not investigate fully.
-
-      Also, let's clear the TX interrupt, if not I seemed to get a spurious
-      interrupt, probably due to the fifo being half-full at this point.
-
-      Note that then I also need to check for EOT already now in this
-      interrupt activation, to avoid a race where EOT could have occured
-      already due to delayed interrupt execution.
-    */
-    HWREG(SSI0_BASE + SSI_O_CR1) |= SSI_CR1_EOT;
-    ROM_SSIIntClear(SSI0_BASE, SSI_TXFF);
-    HWREG(SSI0_BASE + SSI_O_IM) |= SSI_TXFF;
-  }
-  if (!ROM_SSIBusy(SSI0_BASE))
-  {
-    ssi_tx_active = 0;
-    /*
-      Now that the transfer is completely done, set the TX interrupt back
-      to disabled and trigger at 1/2 full fifo.
-    */
-    HWREG(SSI0_BASE + SSI_O_IM) &= ~SSI_TXFF;
-    HWREG(SSI0_BASE + SSI_O_CR1) &= ~SSI_CR1_EOT;
-  }
-  if (ssi_udma_rx_running && !ROM_uDMAChannelIsEnabled(UDMA_CHANNEL_SSI0RX))
-    ssi_udma_rx_running = 0;
+  if (transmit_packet_running && nrf_async_dma_cont(&transmit_packet_state))
+    transmit_packet_running = 0;
 }
 
 
@@ -586,15 +599,20 @@ transmit_packet(uint8_t startval,
                 uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin,
                 uint32_t ce_base, uint32_t ce_pin)
 {
-  uint8_t buf[32];
+  uint8_t buf[33];
   uint8_t recvbuf[33];
   uint32_t i;
 
+  buf[0] = nRF_W_TX_PAYLOAD_NOACK;
   for (i = 0; i < 32; ++i)
-    buf[i] = startval + i;
+    buf[i+1] = startval + i;
   recvbuf[0] = 0;
-  nrf_tx_nack_dma(recvbuf, buf, 32, ssi_base, csn_base, csn_pin);
-  ssi_dma_wait(csn_base, csn_pin);
+  transmit_packet_running = 1;
+  nrf_async_dma_start(&transmit_packet_state, recvbuf, buf, 33, ssi_base,
+                      UDMA_CHANNEL_SSI0RX, UDMA_CHANNEL_SSI0TX,
+                      csn_base, csn_pin);
+  while (transmit_packet_running)
+    ;
   ce_high(ce_base, ce_pin);
 
   while (ROM_GPIOPinRead(GPIO_PORTA_BASE, GPIO_PIN_7))
