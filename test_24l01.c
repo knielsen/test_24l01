@@ -13,6 +13,7 @@
 #include "driverlib/sysctl.h"
 #include "driverlib/uart.h"
 #include "driverlib/ssi.h"
+#include "driverlib/udma.h"
 
 #include "nrf24l01p.h"
 
@@ -161,6 +162,27 @@ config_spi(uint32_t base)
 }
 
 
+static uint32_t udma_control_block[256] __attribute__ ((aligned(1024)));
+static void
+config_udma_for_spi(void)
+{
+  ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_UDMA);
+  ROM_uDMAEnable();
+  ROM_uDMAControlBaseSet(udma_control_block);
+
+  ROM_SSIDMAEnable(SSI0_BASE, SSI_DMA_TX);
+  ROM_IntEnable(INT_SSI0);
+
+  ROM_uDMAChannelAttributeDisable(UDMA_CHANNEL_SSI0TX, UDMA_ATTR_ALTSELECT |
+                                  UDMA_ATTR_REQMASK | UDMA_ATTR_HIGH_PRIORITY);
+  ROM_uDMAChannelAssign(UDMA_CH11_SSI0TX);
+  ROM_uDMAChannelAttributeEnable(UDMA_CHANNEL_SSI0TX, UDMA_ATTR_USEBURST);
+  ROM_uDMAChannelControlSet(UDMA_CHANNEL_SSI0TX | UDMA_PRI_SELECT,
+                            UDMA_SIZE_8 | UDMA_SRC_INC_8 | UDMA_DST_INC_NONE |
+                            UDMA_ARB_4);
+}
+
+
 static void
 bzero(uint8_t *buf, uint32_t len)
 {
@@ -200,10 +222,6 @@ ce_high(uint32_t ce_base, uint32_t ce_pin)
 }
 
 
-/*
-  Set the DC register on TLC5940 through SSI.
-  Then read out the TLC5940 status register and check that DC is correct.
-*/
 static void
 ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
         uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
@@ -247,6 +265,34 @@ ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
 }
 
 
+static volatile uint8_t ssi_udma_running = 0;
+
+static void
+ssi_cmd_dma(uint8_t *sendbuf, uint32_t len, uint32_t csn_base, uint32_t csn_pin)
+{
+  /* Take CSN low to initiate transfer. */
+  csn_low(csn_base, csn_pin);
+
+  ROM_uDMAChannelTransferSet(UDMA_CHANNEL_SSI0TX | UDMA_PRI_SELECT,
+                             UDMA_MODE_BASIC, sendbuf,
+                             (void *)(SSI0_BASE + SSI_O_DR), len);
+  ssi_udma_running = 1;
+  ROM_uDMAChannelEnable(UDMA_CHANNEL_SSI0TX);
+}
+
+
+static void
+ssi_dma_wait(uint32_t csn_base, uint32_t csn_pin)
+{
+  while (ssi_udma_running)
+    ;
+  while (ROM_SSIBusy(SSI0_BASE))
+    ;
+  /* Take CSN high to complete transfer. */
+  csn_high(csn_base, csn_pin);
+}
+
+
 static void
 nrf_rx(uint8_t *data, uint32_t len,
        uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
@@ -262,6 +308,7 @@ nrf_rx(uint8_t *data, uint32_t len,
 }
 
 
+__attribute__((unused))
 static void
 nrf_tx_nack(uint8_t *data, uint32_t len,
             uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
@@ -273,6 +320,21 @@ nrf_tx_nack(uint8_t *data, uint32_t len,
   sendbuf[0] = nRF_W_TX_PAYLOAD_NOACK;
   memcpy(&sendbuf[1], data, len);
   ssi_cmd(recvbuf, sendbuf, len+1, ssi_base, csn_base, csn_pin);
+}
+
+
+static void
+nrf_tx_nack_dma(uint8_t *data, uint32_t len,
+                uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t sendbuf[33];
+
+  if (len > 32)
+    len = 32;
+  sendbuf[0] = nRF_W_TX_PAYLOAD_NOACK;
+  memcpy(&sendbuf[1], data, len);
+  ssi_cmd_dma(sendbuf, len+1, csn_base, csn_pin);
+  ssi_dma_wait(csn_base, csn_pin);
 }
 
 
@@ -447,6 +509,23 @@ IntHandlerGPIOf(void)
 }
 
 
+void
+IntHandlerSSI0(void)
+{
+  uint32_t irq_status = ROM_SSIIntStatus(SSI0_BASE, 1);
+  ROM_SSIIntClear(SSI0_BASE, irq_status);
+  if (!ROM_uDMAChannelIsEnabled(UDMA_CHANNEL_SSI0TX))
+    ssi_udma_running = 0;
+}
+
+
+void
+IntHandlerSSI1(void)
+{
+  serial_output_str("%");
+}
+
+
 static void
 transmit_packet(uint8_t startval,
                 uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin,
@@ -457,7 +536,7 @@ transmit_packet(uint8_t startval,
 
   for (i = 0; i < 32; ++i)
     buf[i] = startval + i;
-  nrf_tx_nack(buf, 32, ssi_base, csn_base, csn_pin);
+  nrf_tx_nack_dma(buf, 32, ssi_base, csn_base, csn_pin);
   ce_high(ce_base, ce_pin);
 
   while (ROM_GPIOPinRead(GPIO_PORTA_BASE, GPIO_PIN_7))
@@ -516,6 +595,7 @@ int main()
 
   serial_output_str("Tx: Setting up...\r\n");
   config_interrupts();
+  config_udma_for_spi();
   nrf_init_config(0 /* Tx */, 2, nRF_RF_PWR_18DBM,
                   SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3);
   serial_output_str("Tx: Read CONFIG=0x");
