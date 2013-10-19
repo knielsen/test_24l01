@@ -171,6 +171,7 @@ config_udma_for_spi(void)
   ROM_uDMAControlBaseSet(udma_control_block);
 
   ROM_SSIDMAEnable(SSI0_BASE, SSI_DMA_TX);
+  ROM_SSIDMAEnable(SSI0_BASE, SSI_DMA_RX);
   ROM_IntEnable(INT_SSI0);
 
   ROM_uDMAChannelAttributeDisable(UDMA_CHANNEL_SSI0TX, UDMA_ATTR_ALTSELECT |
@@ -179,6 +180,14 @@ config_udma_for_spi(void)
   ROM_uDMAChannelAttributeEnable(UDMA_CHANNEL_SSI0TX, UDMA_ATTR_USEBURST);
   ROM_uDMAChannelControlSet(UDMA_CHANNEL_SSI0TX | UDMA_PRI_SELECT,
                             UDMA_SIZE_8 | UDMA_SRC_INC_8 | UDMA_DST_INC_NONE |
+                            UDMA_ARB_4);
+
+  ROM_uDMAChannelAttributeDisable(UDMA_CHANNEL_SSI0RX, UDMA_ATTR_ALTSELECT |
+                                  UDMA_ATTR_REQMASK | UDMA_ATTR_HIGH_PRIORITY);
+  ROM_uDMAChannelAssign(UDMA_CH10_SSI0RX);
+  ROM_uDMAChannelAttributeEnable(UDMA_CHANNEL_SSI0RX, UDMA_ATTR_USEBURST);
+  ROM_uDMAChannelControlSet(UDMA_CHANNEL_SSI0RX | UDMA_PRI_SELECT,
+                            UDMA_SIZE_8 | UDMA_DST_INC_8 | UDMA_SRC_INC_NONE |
                             UDMA_ARB_4);
 }
 
@@ -265,20 +274,30 @@ ssi_cmd(uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
 }
 
 
-static volatile uint8_t ssi_udma_running = 0;
+static volatile uint8_t ssi_udma_rx_running = 0;
+static volatile uint8_t ssi_udma_tx_running = 0;
 static volatile uint8_t ssi_tx_active = 0;
 
 static void
-ssi_cmd_dma(uint8_t *sendbuf, uint32_t len, uint32_t csn_base, uint32_t csn_pin)
+ssi_cmd_dma(uint8_t *recvbuf, uint8_t *sendbuf, uint32_t len,
+            uint32_t csn_base, uint32_t csn_pin)
 {
   /* Take CSN low to initiate transfer. */
   csn_low(csn_base, csn_pin);
 
+  ROM_uDMAChannelTransferSet(UDMA_CHANNEL_SSI0RX | UDMA_PRI_SELECT,
+                             UDMA_MODE_BASIC, (void *)(SSI0_BASE + SSI_O_DR),
+                             recvbuf, len);
   ROM_uDMAChannelTransferSet(UDMA_CHANNEL_SSI0TX | UDMA_PRI_SELECT,
                              UDMA_MODE_BASIC, sendbuf,
                              (void *)(SSI0_BASE + SSI_O_DR), len);
-  ssi_udma_running = 1;
+  ssi_udma_rx_running = 1;
+  ssi_udma_tx_running = 1;
   ssi_tx_active = 1;
+  /* Empty any left-over stuff in the RX FIFO. */
+  while (HWREG(SSI0_BASE + SSI_O_SR) & SSI_SR_RNE)
+    (void)(HWREG(SSI0_BASE + SSI_O_DR));
+  ROM_uDMAChannelEnable(UDMA_CHANNEL_SSI0RX);
   ROM_uDMAChannelEnable(UDMA_CHANNEL_SSI0TX);
 }
 
@@ -286,9 +305,11 @@ ssi_cmd_dma(uint8_t *sendbuf, uint32_t len, uint32_t csn_base, uint32_t csn_pin)
 static void
 ssi_dma_wait(uint32_t csn_base, uint32_t csn_pin)
 {
-  while (ssi_udma_running)
+  while (ssi_udma_tx_running)
     ;
   while (ssi_tx_active)
+    ;
+  while (ssi_udma_rx_running)
     ;
   /* Take CSN high to complete transfer. */
   csn_high(csn_base, csn_pin);
@@ -326,7 +347,7 @@ nrf_tx_nack(uint8_t *data, uint32_t len,
 
 
 static void
-nrf_tx_nack_dma(uint8_t *data, uint32_t len,
+nrf_tx_nack_dma(uint8_t *recvbuf, uint8_t *data, uint32_t len,
                 uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
 {
   uint8_t sendbuf[33];
@@ -335,7 +356,7 @@ nrf_tx_nack_dma(uint8_t *data, uint32_t len,
     len = 32;
   sendbuf[0] = nRF_W_TX_PAYLOAD_NOACK;
   memcpy(&sendbuf[1], data, len);
-  ssi_cmd_dma(sendbuf, len+1, csn_base, csn_pin);
+  ssi_cmd_dma(recvbuf, sendbuf, len+1, csn_base, csn_pin);
 }
 
 
@@ -515,10 +536,10 @@ IntHandlerSSI0(void)
 {
   uint32_t irq_status = ROM_SSIIntStatus(SSI0_BASE, 1);
   ROM_SSIIntClear(SSI0_BASE, irq_status);
-  if (ssi_udma_running && !ROM_uDMAChannelIsEnabled(UDMA_CHANNEL_SSI0TX))
+  if (ssi_udma_tx_running && !ROM_uDMAChannelIsEnabled(UDMA_CHANNEL_SSI0TX))
   {
     /* Dma completed. */
-    ssi_udma_running = 0;
+    ssi_udma_tx_running = 0;
     /*
       Enable interrupt at end of transfer.
 
@@ -548,6 +569,8 @@ IntHandlerSSI0(void)
     HWREG(SSI0_BASE + SSI_O_IM) &= ~SSI_TXFF;
     HWREG(SSI0_BASE + SSI_O_CR1) &= ~SSI_CR1_EOT;
   }
+  if (ssi_udma_rx_running && !ROM_uDMAChannelIsEnabled(UDMA_CHANNEL_SSI0RX))
+    ssi_udma_rx_running = 0;
 }
 
 
@@ -564,11 +587,13 @@ transmit_packet(uint8_t startval,
                 uint32_t ce_base, uint32_t ce_pin)
 {
   uint8_t buf[32];
+  uint8_t recvbuf[33];
   uint32_t i;
 
   for (i = 0; i < 32; ++i)
     buf[i] = startval + i;
-  nrf_tx_nack_dma(buf, 32, ssi_base, csn_base, csn_pin);
+  recvbuf[0] = 0;
+  nrf_tx_nack_dma(recvbuf, buf, 32, ssi_base, csn_base, csn_pin);
   ssi_dma_wait(csn_base, csn_pin);
   ce_high(ce_base, ce_pin);
 
@@ -576,6 +601,9 @@ transmit_packet(uint8_t startval,
     ;
   ce_low(ce_base, ce_pin);
   nrf_write_reg(nRF_STATUS, nRF_TX_DS, ssi_base, csn_base, csn_pin);
+  serial_output_str("Tx: status at send: ");
+  serial_output_hexbyte(recvbuf[0]);
+  serial_output_str("\r\n");
 }
 
 
