@@ -293,7 +293,7 @@ struct nrf_async_dma {
 };
 
 
-uint32_t
+static int32_t
 nrf_async_dma_start(struct nrf_async_dma *a, uint8_t *recvbuf, uint8_t *sendbuf,
                     uint32_t len, uint32_t ssi_base, uint32_t dma_rx_chan,
                     uint32_t dma_tx_chan, uint32_t csn_base, uint32_t csn_pin)
@@ -321,7 +321,7 @@ nrf_async_dma_start(struct nrf_async_dma *a, uint8_t *recvbuf, uint8_t *sendbuf,
 }
 
 
-uint32_t
+static int32_t
 nrf_async_dma_cont(struct nrf_async_dma *a)
 {
   /*
@@ -372,6 +372,91 @@ nrf_async_dma_cont(struct nrf_async_dma *a)
     csn_high(a->csn_base, a->csn_pin);
     return 1;
   }
+}
+
+
+/*
+  Asynchronous SSI transfer to nRF24L01+ using only fifo (no dma).
+  Performs a transaction over SPI <= 8 bytes.
+  First call nrf_async_start(). While nrf_async_start() or nrf_async_cont()
+  returns zero, call nrf_async_cont() for each SSI interrupt event (only
+  transfer done can occur).
+*/
+struct nrf_async_cmd {
+  uint32_t ssi_base;
+  uint32_t csn_base;
+  uint32_t csn_pin;
+  uint8_t *recvbuf;
+  uint8_t ssi_active;
+};
+
+
+/*
+  Start a command, max 8 bytes.
+  recvbuf must remain valid for the duration of the operation, or it can be
+  NULL to ignore anything received.
+  sendbuf can be discarded once nrf_async_cmd_start() returns.
+*/
+static int32_t
+nrf_async_cmd_start(struct nrf_async_cmd *a,
+                    uint8_t *recvbuf, const uint8_t *sendbuf, uint32_t len,
+                    uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  if (len > 8)
+    return -1;
+  a->ssi_base = ssi_base;
+  a->csn_base = csn_base;
+  a->csn_pin = csn_pin;
+  a->recvbuf = recvbuf;
+  a->ssi_active = 1;
+  /* Take CSN low to initiate transfer. */
+  csn_low(csn_base, csn_pin);
+  /* Empty any left-over stuff in the RX FIFO. */
+  while (HWREG(ssi_base + SSI_O_SR) & SSI_SR_RNE)
+    (void)(HWREG(ssi_base + SSI_O_DR));
+
+  /* Set up so we get an interrupt when last bit has been transmitted. */
+  HWREG(ssi_base + SSI_O_CR1) |= SSI_CR1_EOT;
+  ROM_SSIIntClear(ssi_base, SSI_TXFF);
+  HWREG(ssi_base + SSI_O_IM) |= SSI_TXFF;
+
+  while (len > 0)
+  {
+    HWREG(ssi_base + SSI_O_DR) = *sendbuf++;
+    --len;
+  }
+
+  return 0;
+}
+
+
+static int32_t
+nrf_async_cmd_cont(struct nrf_async_cmd *a)
+{
+  uint8_t *p;
+
+  if (!ROM_SSIBusy(a->ssi_base))
+  {
+    a->ssi_active = 0;
+    /*
+      Now that the transfer is completely done, set the TX interrupt back
+      to disabled and trigger at 1/2 full fifo.
+    */
+    HWREG(a->ssi_base + SSI_O_IM) &= ~SSI_TXFF;
+    HWREG(a->ssi_base + SSI_O_CR1) &= ~SSI_CR1_EOT;
+
+    /* Take CSN high to complete transfer. */
+    csn_high(a->csn_base, a->csn_pin);
+
+    /* Empty the receive fifo (and return the data if so requested. */
+    p = a->recvbuf;
+    while (HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_RNE)
+      if (p)
+        *p++ = HWREG(a->ssi_base + SSI_O_DR);
+    return 1;
+  }
+  else
+    return 0;
 }
 
 
@@ -441,6 +526,31 @@ nrf_write_reg(uint8_t reg, uint8_t val,
               uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
 {
   nrf_write_reg_n(reg, &val, 1, ssi_base, csn_base, csn_pin);
+}
+
+
+static int32_t
+nrf_write_reg_n_start(struct nrf_async_cmd *a, uint8_t reg, const uint8_t *data,
+                      uint8_t *recvbuf, uint32_t len, uint32_t ssi_base,
+                      uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t sendbuf[8];
+  if (len > 7)
+    len = 7;
+  sendbuf[0] = nRF_W_REGISTER | reg;
+  memcpy(&sendbuf[1], data, len);
+  return nrf_async_cmd_start(a, recvbuf, sendbuf, len+1, ssi_base,
+                             csn_base, csn_pin);
+}
+
+
+static int32_t
+nrf_write_reg_start(struct nrf_async_cmd *a, uint8_t reg, uint8_t val,
+                    uint8_t *recvbuf,
+                    uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  return nrf_write_reg_n_start(a, reg, &val, recvbuf, 1,
+                               ssi_base, csn_base, csn_pin);
 }
 
 
@@ -578,12 +688,16 @@ IntHandlerGPIOf(void)
 
 struct nrf_async_dma transmit_packet_state;
 volatile uint8_t transmit_packet_running = 0;
+struct nrf_async_cmd nrf_cmd_state;
+volatile uint8_t nrf_cmd_running = 0;
 
 void
 IntHandlerSSI0(void)
 {
   if (transmit_packet_running && nrf_async_dma_cont(&transmit_packet_state))
     transmit_packet_running = 0;
+  else if (nrf_cmd_running && nrf_async_cmd_cont(&nrf_cmd_state))
+    nrf_cmd_running = 0;
 }
 
 
@@ -601,16 +715,17 @@ transmit_packet(uint8_t startval,
 {
   uint8_t buf[33];
   uint8_t recvbuf[33];
+  uint8_t recvbuf2[2];
   uint32_t i;
 
   buf[0] = nRF_W_TX_PAYLOAD_NOACK;
   for (i = 0; i < 32; ++i)
     buf[i+1] = startval + i;
   recvbuf[0] = 0;
-  transmit_packet_running = 1;
-  nrf_async_dma_start(&transmit_packet_state, recvbuf, buf, 33, ssi_base,
-                      UDMA_CHANNEL_SSI0RX, UDMA_CHANNEL_SSI0TX,
-                      csn_base, csn_pin);
+  transmit_packet_running =
+    !nrf_async_dma_start(&transmit_packet_state, recvbuf, buf, 33, ssi_base,
+                         UDMA_CHANNEL_SSI0RX, UDMA_CHANNEL_SSI0TX,
+                         csn_base, csn_pin);
   while (transmit_packet_running)
     ;
   ce_high(ce_base, ce_pin);
@@ -618,9 +733,15 @@ transmit_packet(uint8_t startval,
   while (ROM_GPIOPinRead(GPIO_PORTA_BASE, GPIO_PIN_7))
     ;
   ce_low(ce_base, ce_pin);
-  nrf_write_reg(nRF_STATUS, nRF_TX_DS, ssi_base, csn_base, csn_pin);
+  nrf_cmd_running =
+    !nrf_write_reg_start(&nrf_cmd_state, nRF_STATUS, nRF_TX_DS, recvbuf2,
+                         ssi_base, csn_base, csn_pin);
+  while (nrf_cmd_running)
+    ;
   serial_output_str("Tx: status at send: ");
   serial_output_hexbyte(recvbuf[0]);
+  serial_output_str(", at write_reg: ");
+  serial_output_hexbyte(recvbuf2[0]);
   serial_output_str("\r\n");
 }
 
