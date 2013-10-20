@@ -1,0 +1,13 @@
+Test program for nRF24L01+ wireless device on Tiva TM4C Cortex-M4
+microcontroller.
+
+Send packets back-to-back, to maximise the throughput (without
+retransmit, so unreliable transfer similar to UDP).
+
+Able to get around 195 kbyte/second of payload data throughput.
+
+Code is written in interrupt-drivent / event-driven style, allowing
+transfers to run in the background, with the main program free to do
+other things meanwhile.
+
+License: GPL, V2 or later.
