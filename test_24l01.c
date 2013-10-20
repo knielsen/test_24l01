@@ -191,6 +191,12 @@ config_udma_for_spi(void)
   ROM_uDMAChannelControlSet(UDMA_CHANNEL_SSI0RX | UDMA_PRI_SELECT,
                             UDMA_SIZE_8 | UDMA_DST_INC_8 | UDMA_SRC_INC_NONE |
                             UDMA_ARB_4);
+
+  /*
+    Tiva Errata says that SSI0 and SSI1 cannot use uDMA at the same time.
+    So just set up SSI1 with interrupts, no uDMA.
+  */
+  ROM_IntEnable(INT_SSI1);
 }
 
 
@@ -351,7 +357,6 @@ nrf_async_dma_cont(struct nrf_async_dma *a)
       already due to delayed interrupt execution.
     */
     HWREG(a->ssi_base + SSI_O_CR1) |= SSI_CR1_EOT;
-    ROM_SSIIntClear(a->ssi_base, SSI_TXFF);
     HWREG(a->ssi_base + SSI_O_IM) |= SSI_TXFF;
   }
   if (!ROM_SSIBusy(a->ssi_base))
@@ -419,7 +424,6 @@ nrf_async_cmd_start(struct nrf_async_cmd *a,
 
   /* Set up so we get an interrupt when last bit has been transmitted. */
   HWREG(ssi_base + SSI_O_CR1) |= SSI_CR1_EOT;
-  ROM_SSIIntClear(ssi_base, SSI_TXFF);
   HWREG(ssi_base + SSI_O_IM) |= SSI_TXFF;
 
   while (len > 0)
@@ -465,6 +469,167 @@ nrf_async_cmd_cont(struct nrf_async_cmd *a)
 }
 
 
+/*
+  Asynchronous SSI fetch of received packet from nRF24L01+ using interrupt
+  (no dma, due to the Tiva errata that SSI0 and SSI1 cannot both use DMA at the
+  same time).
+
+  First call nrf_async_start(). While nrf_async_start() or nrf_async_cont()
+  returns zero, call nrf_async_cont() for each SSI interrupt event (Tx fifo
+  less that 1/2 full and end-of-transfer).
+*/
+struct nrf_async_rcv {
+  uint32_t ssi_base;
+  uint32_t csn_base;
+  uint32_t csn_pin;
+  uint8_t *status_out;
+  uint8_t *packet_out;
+  uint32_t remain_tx_bytes;
+};
+
+
+/*
+  Start a receive TX packet command (R_RX_PAYLOAD).
+  The packet data is written to memory at `packet_out', size `len'.
+  The value of register STATUS is written to *status_out, if non-NULL.
+*/
+static int32_t
+nrf_async_rcv_start(struct nrf_async_rcv *a, uint8_t *status_out,
+                    uint8_t *packet_out, uint32_t len,
+                    uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  static uint8_t dummy_byte;
+
+  a->ssi_base = ssi_base;
+  a->csn_base = csn_base;
+  a->csn_pin = csn_pin;
+  a->status_out = status_out ? status_out : &dummy_byte;
+  a->packet_out = packet_out;
+
+  /* Take CSN low to initiate transfer. */
+  csn_low(csn_base, csn_pin);
+  /* Empty any left-over stuff in the RX FIFO. */
+  while (HWREG(ssi_base + SSI_O_SR) & SSI_SR_RNE)
+    (void)(HWREG(ssi_base + SSI_O_DR));
+
+  if (len+1 > 8)
+  {
+    uint32_t i;
+
+    HWREG(ssi_base + SSI_O_DR) = nRF_R_RX_PAYLOAD;
+    for (i = 1; i < 8; ++i)
+      HWREG(ssi_base + SSI_O_DR) = 0;
+    a->remain_tx_bytes = len - (8-1);
+
+    /* Set up to get an interrupt when the SSI TX fifo is 1/2 full or less. */
+    HWREG(ssi_base + SSI_O_CR1) &= ~SSI_CR1_EOT;
+    HWREG(ssi_base + SSI_O_IM) |= SSI_TXFF;
+  }
+  else
+  {
+    HWREG(ssi_base + SSI_O_DR) = nRF_R_RX_PAYLOAD;
+    while (len > 0)
+    {
+      HWREG(ssi_base + SSI_O_DR) = 0;
+      --len;
+    }
+    a->remain_tx_bytes = 0;
+
+    /* Everything fits in the SSI FIFO, so just get an interrupt at the end. */
+    HWREG(ssi_base + SSI_O_CR1) |= SSI_CR1_EOT;
+    HWREG(ssi_base + SSI_O_IM) |= SSI_TXFF;
+  }
+
+  return 0;
+}
+
+
+static inline void
+nrf_async_rcv_grab_rx_bytes(struct nrf_async_rcv *a)
+{
+  if ((HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_RNE) && a->status_out)
+  {
+    /* First byte is STATUS register. */
+    *(a->status_out) = HWREG(a->ssi_base + SSI_O_DR);
+    a->status_out = NULL;
+  }
+
+  if (HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_RNE)
+  {
+    uint8_t *p = a->packet_out;
+    do
+    {
+      *p++ = HWREG(a->ssi_base + SSI_O_DR);
+    } while (HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_RNE);
+    a->packet_out = p;
+  }
+}
+
+
+static int32_t
+nrf_async_rcv_cont(struct nrf_async_rcv *a)
+{
+  uint32_t remain;
+
+  remain = a->remain_tx_bytes;
+  if (remain)
+  {
+    if (HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_TNF)
+    {
+      do
+      {
+        /*
+          Avoid races that could cause SSI receive fifo to overflow, even if
+          this code happens to run so slow that SSI can drain the transmit fifo
+          as fast as we can fill it.
+
+          At this point we know the SSI transmit fifo has at most 7 elements;
+          if we empty the receive fifo, then there is sure to be room for
+          those 7 elements + one more that we put in.
+        */
+        nrf_async_rcv_grab_rx_bytes(a);
+        HWREG(a->ssi_base + SSI_O_DR) = 0;
+        --remain;
+        if (remain == 0)
+        {
+          /*
+            Now that we have put all bytes into the fifo, change to get an
+            interrupt when everything has been transmitted.
+
+            Note that we will check for this condition below, to avoid a race
+            when the transfer completes in the middle of executing this code.
+          */
+          HWREG(a->ssi_base + SSI_O_CR1) |= SSI_CR1_EOT;
+          HWREG(a->ssi_base + SSI_O_IM) |= SSI_TXFF;
+          break;
+        }
+      } while (HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_TNF);
+      a->remain_tx_bytes = remain;
+    }
+  }
+
+  if (remain == 0 && !ROM_SSIBusy(a->ssi_base))
+  {
+    /*
+      Now that the transfer is completely done, set the TX interrupt back
+      to disabled and trigger at 1/2 full fifo.
+    */
+    HWREG(a->ssi_base + SSI_O_IM) &= ~SSI_TXFF;
+    HWREG(a->ssi_base + SSI_O_CR1) &= ~SSI_CR1_EOT;
+
+    /* Take CSN high to complete transfer. */
+    csn_high(a->csn_base, a->csn_pin);
+
+    /* Grab any remaining data from the Rx FIFO. */
+    nrf_async_rcv_grab_rx_bytes(a);
+    return 1;
+  }
+  else
+    return 0;
+}
+
+
+__attribute__((unused))
 static void
 nrf_rx(uint8_t *data, uint32_t len,
        uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
@@ -951,9 +1116,9 @@ IntHandlerGPIOf(void)
 }
 
 
-struct nrf_async_dma transmit_packet_state;
+static struct nrf_async_dma transmit_packet_state;
 volatile uint8_t transmit_packet_running = 0;
-struct nrf_async_cmd nrf_cmd_state;
+static struct nrf_async_cmd nrf_cmd_state;
 volatile uint8_t nrf_cmd_running = 0;
 
 void
@@ -969,10 +1134,14 @@ IntHandlerSSI0(void)
 }
 
 
+static struct nrf_async_rcv nrf_rcv_state;
+volatile uint8_t nrf_rcv_running = 0;
+
 void
 IntHandlerSSI1(void)
 {
-  serial_output_str("%");
+  if (nrf_rcv_running && nrf_async_rcv_cont(&nrf_rcv_state))
+    nrf_rcv_running = 0;
 }
 
 
@@ -1068,7 +1237,11 @@ receive_packets(uint32_t count, uint32_t ssi_base, uint32_t csn_base,
       if (val & nRF_RX_EMPTY)
         break;
 
-      nrf_rx(buf, 32, ssi_base, csn_base, csn_pin);
+      nrf_rcv_running = 1;
+      nrf_async_rcv_start(&nrf_rcv_state, &status, buf, 32,
+                          ssi_base, csn_base, csn_pin);
+      while (nrf_rcv_running)
+        ;
       nrf_write_reg(nRF_STATUS, nRF_RX_DR, ssi_base, csn_base, csn_pin);
 
       if (count <= 1)
