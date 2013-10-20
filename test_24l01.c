@@ -6,6 +6,7 @@
 #include "inc/hw_sysctl.h"
 #include "inc/hw_types.h"
 #include "inc/hw_ints.h"
+#include "inc/hw_nvic.h"
 #include "inc/hw_ssi.h"
 #include "driverlib/gpio.h"
 #include "driverlib/rom.h"
@@ -14,6 +15,7 @@
 #include "driverlib/uart.h"
 #include "driverlib/ssi.h"
 #include "driverlib/udma.h"
+#include "driverlib/systick.h"
 
 #include "nrf24l01p.h"
 
@@ -1052,7 +1054,6 @@ receive_packets(uint32_t count, uint32_t ssi_base, uint32_t csn_base,
                 uint32_t csn_pin, uint32_t ce_base, uint32_t ce_pin)
 {
   uint8_t buf[32];
-  uint32_t i;
   uint8_t val, status;
 
   for (;;)
@@ -1072,10 +1073,14 @@ receive_packets(uint32_t count, uint32_t ssi_base, uint32_t csn_base,
 
       if (count <= 1)
       {
+#if 0
+        uint32_t i;
+        /* Blocking serial output here messes up time measurement. */
         serial_output_str("Rx last packet: ");
         for (i = 0; i < 32; ++i)
           serial_output_hexbyte(buf[i]);
         serial_output_str("\r\n");
+#endif
         return;
       }
       --count;
@@ -1084,15 +1089,41 @@ receive_packets(uint32_t count, uint32_t ssi_base, uint32_t csn_base,
 }
 
 
+static void
+setup_systick(void)
+{
+  ROM_SysTickPeriodSet(0xffffff+1);
+  /* Force reload. */
+  HWREG(NVIC_ST_CURRENT) = 0;
+  ROM_SysTickEnable();
+}
+
+static inline uint32_t
+get_time(void)
+{
+  return HWREG(NVIC_ST_CURRENT);
+}
+
+
+static inline uint32_t
+calc_time(uint32_t start)
+{
+  uint32_t stop = HWREG(NVIC_ST_CURRENT);
+  return (start - stop) & 0xffffff;
+}
+
+
 int main()
 {
   uint8_t status;
   uint8_t val;
+  uint32_t start, delta;
 
   /* Use the full 80MHz system clock. */
   ROM_SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL |
                      SYSCTL_OSC_MAIN | SYSCTL_XTAL_16MHZ);
   ROM_FPULazyStackingEnable();
+  setup_systick();
 
   /* Configure serial. */
   ROM_SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
@@ -1143,16 +1174,21 @@ int main()
 
 //  transmit_packet(42, SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3,
 //                  GPIO_PORTA_BASE, GPIO_PIN_6);
-  transmit_multi_packet_start(42, 15, SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3,
+  serial_output_str("Start timer...\r\n");
+  start = get_time();
+  transmit_multi_packet_start(42, 24, SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3,
                               GPIO_PORTA_BASE, GPIO_PIN_6,
                               GPIO_PORTA_BASE, GPIO_PIN_7);
   //serial_output_str("Tx: Sent packet\r\n");
 
   //serial_output_str("Rx: Waiting for packet...\r\n");
-  receive_packets(15, SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3,
+  receive_packets(24, SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3,
                   GPIO_PORTB_BASE, GPIO_PIN_0);
   transmit_multi_packet_wait();
-  serial_output_str("Tx: transmit done\r\n");
+  delta = calc_time(start);
+  serial_output_str("Stop timer\r\n");
+  serial_output_str("Tx: transmit done, total usec=");
+  println_uint32(delta/(MCU_HZ/1000000));
 
   for(;;)
     ;
