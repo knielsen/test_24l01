@@ -451,8 +451,11 @@ nrf_async_cmd_cont(struct nrf_async_cmd *a)
     /* Empty the receive fifo (and return the data if so requested. */
     p = a->recvbuf;
     while (HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_RNE)
+    {
+      uint8_t v = HWREG(a->ssi_base + SSI_O_DR);
       if (p)
-        *p++ = HWREG(a->ssi_base + SSI_O_DR);
+        *p++ = v;
+    }
     return 1;
   }
   else
@@ -579,6 +582,258 @@ nrf_read_reg(uint8_t reg, uint8_t *status_ptr,
 }
 
 
+static int32_t
+nrf_read_reg_n_start(struct nrf_async_cmd *a, uint8_t reg, uint8_t *recvbuf,
+                     uint32_t len, uint32_t ssi_base,
+                     uint32_t csn_base, uint32_t csn_pin)
+{
+  uint8_t sendbuf[8];
+  if (len > 7)
+    len = 7;
+  sendbuf[0] = nRF_R_REGISTER | reg;
+  bzero(&sendbuf[1], len);
+  return nrf_async_cmd_start(a, recvbuf, sendbuf, len+1, ssi_base,
+                             csn_base, csn_pin);
+}
+
+
+static int32_t
+nrf_read_reg_start(struct nrf_async_cmd *a, uint8_t reg, uint8_t *recvbuf,
+                   uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin)
+{
+  return nrf_read_reg_n_start(a, reg, recvbuf, 1,
+                              ssi_base, csn_base, csn_pin);
+}
+
+
+/*
+  Transmit a number of packets back-to-back with the nRF24L01+.
+
+  The packets are filled in by a call-back function. This callback is invoked
+  from interrupt context, so it should ideally be fairly quick and has to be
+  aware of the general interrupt caveats.
+*/
+struct nrf_async_transmit_multi {
+  void (*fillpacket)(uint8_t *, void *);
+  void *cb_data;
+  uint32_t ssi_base;
+  uint32_t dma_rx_chan, dma_tx_chan;
+  uint32_t csn_base, csn_pin;
+  uint32_t ce_base, ce_pin;
+  uint32_t irq_base, irq_pin;
+  uint32_t remain;
+  union {
+    struct nrf_async_dma dma;
+    struct nrf_async_cmd cmd;
+  } substate;
+  uint8_t sendbuf[33];
+  uint8_t recvbuf[33];
+  uint8_t transmit_packet_running;
+  uint8_t nrf_cmd_running;
+  uint8_t ce_asserted;
+  uint8_t state;
+};
+enum nrf_async_transmit_multi_states {
+  ST_NRF_ATM_WRITE_TO_FIFO,
+  ST_NRF_ATM_CLEAR_DS,
+  ST_NRF_ATM_CHECK_FIFO_ROOM,
+  ST_NRF_ATM_WAIT_FOR_DONE,
+  ST_NRF_ATM_CHECK_FIFO_EMPTY,
+  ST_NRF_ATM_CHECK_IF_DONE,
+};
+
+static int32_t
+nrf_async_transmit_multi_cont(struct nrf_async_transmit_multi *a,
+                              uint32_t is_ssi_event);
+static int32_t
+nrf_async_transmit_multi_start(struct nrf_async_transmit_multi *a,
+                               void (*fillpacket)(uint8_t *, void *),
+                               void *cb_data, uint32_t count, uint32_t ssi_base,
+                               uint32_t dma_rx_chan, uint32_t dma_tx_chan,
+                               uint32_t csn_base, uint32_t csn_pin,
+                               uint32_t ce_base, uint32_t ce_pin,
+                               uint32_t irq_base, uint32_t irq_pin)
+{
+  a->fillpacket = fillpacket;
+  a->cb_data = cb_data;
+  a->ssi_base = ssi_base;
+  a->dma_rx_chan = dma_rx_chan;
+  a->dma_tx_chan = dma_tx_chan;
+  a->csn_base = csn_base;
+  a->csn_pin = csn_pin;
+  a->ce_base = ce_base;
+  a->ce_pin = ce_pin;
+  a->irq_base = irq_base;
+  a->irq_pin = irq_pin;
+  a->remain = count;
+  a->transmit_packet_running = 0;
+  a->nrf_cmd_running = 0;
+  a->ce_asserted = 0;
+  a->state = ST_NRF_ATM_WRITE_TO_FIFO;
+  return nrf_async_transmit_multi_cont(a, 0);
+}
+
+
+/*
+  Called to continue a multi-packet back-to-back write session.
+  This should be called when an event occurs, either in the form of
+  an SSI interrupt or in the form of a GPIO interrupt on the nRF24L01+
+  IRQ pin (the is_ssi_event flag tells which).
+
+  The two interrupts should be configured to have the same priority, so that
+  one of them does not attempt to pre-empt the other; that would lead to
+  nasty races.
+*/
+static int32_t
+nrf_async_transmit_multi_cont(struct nrf_async_transmit_multi *a,
+                              uint32_t is_ssi_event)
+{
+  if (is_ssi_event && a->transmit_packet_running)
+  {
+    if (nrf_async_dma_cont(&a->substate.dma))
+      a->transmit_packet_running = 0;
+    else
+      return 0;
+  }
+  else if (is_ssi_event && a->nrf_cmd_running)
+  {
+    if (nrf_async_cmd_cont(&a->substate.cmd))
+      a->nrf_cmd_running = 0;
+    else
+      return 0;
+  }
+
+resched:
+  switch (a->state)
+  {
+  case ST_NRF_ATM_WRITE_TO_FIFO:
+    /*
+      In this state, there is room in the transmit fifo of the nRF24L01+.
+      So start an SPI transaction to inject another packet (or prepare to
+      finish if all packets sent).
+    */
+    if (a->remain == 0)
+    {
+      /* All sent, go wait for FIFO to empty. */
+      a->state = ST_NRF_ATM_WAIT_FOR_DONE;
+      goto resched;
+    }
+    --a->remain;
+    a->sendbuf[0] = nRF_W_TX_PAYLOAD_NOACK;
+    (*(a->fillpacket))(&(a->sendbuf[1]), a->cb_data);
+    a->transmit_packet_running = 1;
+    nrf_async_dma_start(&a->substate.dma, a->recvbuf, a->sendbuf, 33,
+                        a->ssi_base, a->dma_rx_chan, a->dma_tx_chan,
+                        a->csn_base, a->csn_pin);
+    a->state = ST_NRF_ATM_CLEAR_DS;
+    return 0;
+
+  case ST_NRF_ATM_CLEAR_DS:
+    /*
+      In this state, we clear any TX_DS flag, and in the process get back
+      the STATUS register so we can check if there is room in the TX FIFO
+      of the nRF24L01+.
+    */
+    ROM_GPIOPinIntDisable(a->irq_base, a->irq_pin);
+    /* Once we have put stuff into the FIFO, assert CE to start sending. */
+    if (!a->ce_asserted)
+    {
+      ce_high(a->ce_base, a->ce_pin);
+      a->ce_asserted = 1;
+    }
+    /*
+      Now clear the TX_DS flag, and at the same time get the STATUS register
+      to see if there is room for more packets in the TX FIFO.
+    */
+    a->nrf_cmd_running = 1;
+    nrf_write_reg_start(&a->substate.cmd, nRF_STATUS, nRF_TX_DS, a->recvbuf,
+                        a->ssi_base, a->csn_base, a->csn_pin);
+    a->state = ST_NRF_ATM_CHECK_FIFO_ROOM;
+    return 0;
+
+  case ST_NRF_ATM_CHECK_FIFO_ROOM:
+    /*
+      In this state, we have received the value on STATUS in recvbuf[0].
+      Checking the TX_FULL flag, we decide whether to inject another
+      packet or wait for one to be sent first.
+    */
+    if (a->recvbuf[0] & nRF_TX_FULL)
+    {
+      /*
+        We have managed to fill up the TX FIFO.
+        Now enable interrupt on the IRQ pin. This will trigger when one more
+        packet gets sent (TX_DS) so that there is more room in the FIFO.
+
+        Once we get that interrupt, we will again clear the TX_DS flag and
+        fill in as many packets in the TX FIFO as will fit.
+      */
+      a->state = ST_NRF_ATM_CLEAR_DS;
+      ROM_GPIOPinIntEnable(a->irq_base, a->irq_pin);
+      return 0;
+      /*
+        I suppose there is a small race here, if the DS flag got asserted
+        just before we clear it. It does not really matter, we still have two
+        packets in the TX fifo, so we have time to inject more once one of
+        them gets sent and re-assert the DS flag.
+      */
+    }
+
+    /* There is room for (at least) one more packet in the FIFO. */
+    a->state = ST_NRF_ATM_WRITE_TO_FIFO;
+    goto resched;
+
+  case ST_NRF_ATM_WAIT_FOR_DONE:
+    /*
+      Clear any TX_DS flag. After that we will check FIFO_STATUS
+      and either stop if it is empty, or wait for another TX_DS if it
+      is not.
+    */
+    ROM_GPIOPinIntDisable(a->irq_base, a->irq_pin);
+    a->nrf_cmd_running = 1;
+    nrf_write_reg_start(&a->substate.cmd, nRF_STATUS, nRF_TX_DS, NULL,
+                        a->ssi_base, a->csn_base, a->csn_pin);
+    a->state = ST_NRF_ATM_CHECK_FIFO_EMPTY;
+    return 0;
+
+  case ST_NRF_ATM_CHECK_FIFO_EMPTY:
+    /*
+      We have cleared TX_DS. Now send a FIFO_STATUS. Either the FIFO_STATUS
+      will show that the TX FIFO is now empty, or we will get an IRQ on a
+      new TX_DS when a packet has been sent from the FIFO.
+    */
+    a->nrf_cmd_running = 1;
+    nrf_read_reg_start(&a->substate.cmd, nRF_FIFO_STATUS, a->recvbuf,
+                       a->ssi_base, a->csn_base, a->csn_pin);
+    a->state = ST_NRF_ATM_CHECK_IF_DONE;
+    return 0;
+
+  case ST_NRF_ATM_CHECK_IF_DONE:
+    if (!(a->recvbuf[1] & nRF_TX_EMPTY))
+    {
+      /*
+        There is still data in the FIFO. Wait for IRQ line to be asserted
+        marking another transmit completed, and then check again.
+      */
+      a->state = ST_NRF_ATM_WAIT_FOR_DONE;
+      ROM_GPIOPinIntEnable(a->irq_base, a->irq_pin);
+      return 0;
+    }
+
+    /*
+      Now the TX FIFO is empty, we can de-assert CE, then the nRF24L01+ will
+      finish transmitting any last packet, and then go to standby mode.
+    */
+    ce_low(a->ce_base, a->ce_pin);
+    a->ce_asserted = 0;
+    return 1;
+
+  default:
+    /* This shouldn't really happen ... */
+    return 0;
+  }
+}
+
+
 /*
   Configure nRF24L01+ as Rx or Tx.
     channel - radio frequency channel to use, 0 <= channel <= 127.
@@ -637,31 +892,39 @@ static void
 config_interrupts(void)
 {
   ROM_GPIOIntTypeSet(GPIO_PORTA_BASE, GPIO_PIN_7, GPIO_LOW_LEVEL);
-  ROM_GPIOPinIntEnable(GPIO_PORTA_BASE, GPIO_PIN_7);
+  //ROM_GPIOPinIntEnable(GPIO_PORTA_BASE, GPIO_PIN_7);
   ROM_GPIOIntTypeSet(GPIO_PORTF_BASE, GPIO_PIN_4, GPIO_LOW_LEVEL);
-  ROM_GPIOPinIntEnable(GPIO_PORTF_BASE, GPIO_PIN_4);
+  //ROM_GPIOPinIntEnable(GPIO_PORTF_BASE, GPIO_PIN_4);
   ROM_IntMasterEnable();
   ROM_IntEnable(INT_GPIOA);
   ROM_IntEnable(INT_GPIOF);
 }
 
 
+static struct nrf_async_transmit_multi transmit_multi_state;
+static volatile uint8_t transmit_multi_running = 0;
 void
 IntHandlerGPIOa(void)
 {
   uint32_t irq_status = HWREG(GPIO_PORTA_BASE + GPIO_O_MIS) & 0xff;
   if (irq_status & GPIO_PIN_7)
   {
-    /* Tx IRQ. */
+    if (transmit_multi_running)
+    {
+      if (nrf_async_transmit_multi_cont(&transmit_multi_state, 0))
+        transmit_multi_running = 0;
+    }
+    else
+    {
+      /*
+        Clear the interrupt request and disable further interrupts until we can
+        clear the request from the device over SPI.
+      */
+      HWREG(GPIO_PORTA_BASE + GPIO_O_IM) &= ~GPIO_PIN_7 & 0xff;
+      HWREG(GPIO_PORTA_BASE + GPIO_O_ICR) = GPIO_PIN_7;
 
-    /*
-      Clear the interrupt request and disable further interrupts until we can
-      clear the request from the device over SPI.
-    */
-    HWREG(GPIO_PORTA_BASE + GPIO_O_IM) &= ~GPIO_PIN_7 & 0xff;
-    HWREG(GPIO_PORTA_BASE + GPIO_O_ICR) = GPIO_PIN_7;
-
-    serial_output_str("Tx: IRQ: TX_DS\r\n");
+      serial_output_str("Tx: IRQ: TX_DS (spurious)\r\n");
+    }
   }
 }
 
@@ -694,7 +957,10 @@ volatile uint8_t nrf_cmd_running = 0;
 void
 IntHandlerSSI0(void)
 {
-  if (transmit_packet_running && nrf_async_dma_cont(&transmit_packet_state))
+  if (transmit_multi_running &&
+      nrf_async_transmit_multi_cont(&transmit_multi_state, 1))
+    transmit_multi_running = 0;
+  else if (transmit_packet_running && nrf_async_dma_cont(&transmit_packet_state))
     transmit_packet_running = 0;
   else if (nrf_cmd_running && nrf_async_cmd_cont(&nrf_cmd_state))
     nrf_cmd_running = 0;
@@ -708,6 +974,7 @@ IntHandlerSSI1(void)
 }
 
 
+__attribute__((unused))
 static void
 transmit_packet(uint8_t startval,
                 uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin,
@@ -747,22 +1014,73 @@ transmit_packet(uint8_t startval,
 
 
 static void
-receive_packet(uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin,
-               uint32_t ce_base, uint32_t ce_pin)
+my_fill_packet(uint8_t *buf, void *d)
+{
+  uint8_t *valp = d;
+  uint8_t startval = (*valp)++;
+  uint32_t i;
+
+  for (i = 0; i < 32; ++i)
+    buf[i] = startval + i;
+}
+
+
+static void
+transmit_multi_packet_start(uint8_t startval, uint32_t count,
+                            uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin,
+                            uint32_t ce_base, uint32_t ce_pin,
+                            uint32_t irq_base, uint32_t irq_pin)
+{
+  transmit_multi_running = 1;
+  nrf_async_transmit_multi_start(&transmit_multi_state, my_fill_packet,
+                                 &startval, count, ssi_base,
+                                 UDMA_CHANNEL_SSI0RX, UDMA_CHANNEL_SSI0TX,
+                                 csn_base, csn_pin, ce_base, ce_pin,
+                                 irq_base, irq_pin);
+}
+
+static void
+transmit_multi_packet_wait(void)
+{
+  while (transmit_multi_running)
+    ;
+}
+
+
+static void
+receive_packets(uint32_t count, uint32_t ssi_base, uint32_t csn_base,
+                uint32_t csn_pin, uint32_t ce_base, uint32_t ce_pin)
 {
   uint8_t buf[32];
   uint32_t i;
+  uint8_t val, status;
 
-  while (ROM_GPIOPinRead(GPIO_PORTF_BASE, GPIO_PIN_4))
-    ;
+  for (;;)
+  {
+    while (ROM_GPIOPinRead(GPIO_PORTF_BASE, GPIO_PIN_4))
+      ;
 
-  nrf_rx(buf, 32, ssi_base, csn_base, csn_pin);
-  nrf_write_reg(nRF_STATUS, nRF_RX_DR, ssi_base, csn_base, csn_pin);
+    for (;;)
+    {
+      val = nrf_read_reg(nRF_FIFO_STATUS, &status,
+                         SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
+      if (val & nRF_RX_EMPTY)
+        break;
 
-  serial_output_str("Rx packet: ");
-  for (i = 0; i < 32; ++i)
-    serial_output_hexbyte(buf[i]);
-  serial_output_str("\r\n");
+      nrf_rx(buf, 32, ssi_base, csn_base, csn_pin);
+      nrf_write_reg(nRF_STATUS, nRF_RX_DR, ssi_base, csn_base, csn_pin);
+
+      if (count <= 1)
+      {
+        serial_output_str("Rx last packet: ");
+        for (i = 0; i < 32; ++i)
+          serial_output_hexbyte(buf[i]);
+        serial_output_str("\r\n");
+        return;
+      }
+      --count;
+    }
+  }
 }
 
 
@@ -823,13 +1141,18 @@ int main()
   /* Wait a bit to make sure Rx is ready. */
   ROM_SysCtlDelay(MCU_HZ/3/100);
 
-  transmit_packet(42, SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3,
-                  GPIO_PORTA_BASE, GPIO_PIN_6);
-  serial_output_str("Tx: Sent packet\r\n");
+//  transmit_packet(42, SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3,
+//                  GPIO_PORTA_BASE, GPIO_PIN_6);
+  transmit_multi_packet_start(42, 15, SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3,
+                              GPIO_PORTA_BASE, GPIO_PIN_6,
+                              GPIO_PORTA_BASE, GPIO_PIN_7);
+  //serial_output_str("Tx: Sent packet\r\n");
 
-  serial_output_str("Rx: Waiting for packet...\r\n");
-  receive_packet(SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3,
-                 GPIO_PORTB_BASE, GPIO_PIN_0);
+  //serial_output_str("Rx: Waiting for packet...\r\n");
+  receive_packets(15, SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3,
+                  GPIO_PORTB_BASE, GPIO_PIN_0);
+  transmit_multi_packet_wait();
+  serial_output_str("Tx: transmit done\r\n");
 
   for(;;)
     ;
