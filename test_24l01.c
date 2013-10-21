@@ -484,6 +484,7 @@ struct nrf_async_rcv {
   uint32_t csn_pin;
   uint8_t *status_out;
   uint8_t *packet_out;
+  uint32_t remain_rx_bytes;
   uint32_t remain_tx_bytes;
 };
 
@@ -505,8 +506,9 @@ nrf_async_rcv_start(struct nrf_async_rcv *a, uint8_t *status_out,
   a->csn_pin = csn_pin;
   a->status_out = status_out ? status_out : &dummy_byte;
   a->packet_out = packet_out;
+  a->remain_rx_bytes = len+1;
 
-  /* Take CSN low to initiate transfer. */
+  /* Take CSN low to enter receive mode. */
   csn_low(csn_base, csn_pin);
   /* Empty any left-over stuff in the RX FIFO. */
   while (HWREG(ssi_base + SSI_O_SR) & SSI_SR_RNE)
@@ -544,24 +546,34 @@ nrf_async_rcv_start(struct nrf_async_rcv *a, uint8_t *status_out,
 }
 
 
+/* Called to empty the SSI receive FIFO. */
 static inline void
 nrf_async_rcv_grab_rx_bytes(struct nrf_async_rcv *a)
 {
-  if ((HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_RNE) && a->status_out)
+  uint32_t rx_not_empty = HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_RNE;
+  if (rx_not_empty)
   {
-    /* First byte is STATUS register. */
-    *(a->status_out) = HWREG(a->ssi_base + SSI_O_DR);
-    a->status_out = NULL;
-  }
-
-  if (HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_RNE)
-  {
-    uint8_t *p = a->packet_out;
-    do
+    uint32_t remain_rx = a->remain_rx_bytes;
+    if (a->status_out)
     {
-      *p++ = HWREG(a->ssi_base + SSI_O_DR);
-    } while (HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_RNE);
-    a->packet_out = p;
+      /* First byte is STATUS register. */
+      *(a->status_out) = HWREG(a->ssi_base + SSI_O_DR);
+      --remain_rx;
+      a->status_out = NULL;
+      rx_not_empty = HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_RNE;
+    }
+
+    if (rx_not_empty)
+    {
+      uint8_t *p = a->packet_out;
+      do
+      {
+        *p++ = HWREG(a->ssi_base + SSI_O_DR);
+        --remain_rx;
+      } while (HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_RNE);
+      a->packet_out = p;
+    }
+    a->remain_rx_bytes = remain_rx;
   }
 }
 
@@ -569,46 +581,47 @@ nrf_async_rcv_grab_rx_bytes(struct nrf_async_rcv *a)
 static int32_t
 nrf_async_rcv_cont(struct nrf_async_rcv *a)
 {
-  uint32_t remain;
+  uint32_t remain_rx, remain_tx;
 
-  remain = a->remain_tx_bytes;
-  if (remain)
+  /* First grab everything in the SSI receive fifo. */
+  nrf_async_rcv_grab_rx_bytes(a);
+  remain_rx = a->remain_rx_bytes;
+  remain_tx = a->remain_tx_bytes;
+  /*
+    Now fill up the SSI transmit fifo with more (dummy) bytes.
+
+    However, we need to ensure we never fill in more that 8 bytes ahead of
+    what we have received. Otherwise we might end up with 8 bytes in the SSI
+    transmit fifo + one more byte in the SSI output shift register. This would
+    result in 9 receive bytes to be put into the SSI receive fifo, so if we
+    were late in responding to interrupts we could end up overflowing the
+    receive fifo and lose one byte.
+  */
+  if (remain_tx > 0 && remain_tx + 8 > remain_rx)
   {
-    if (HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_TNF)
+    do
     {
-      do
-      {
-        /*
-          Avoid races that could cause SSI receive fifo to overflow, even if
-          this code happens to run so slow that SSI can drain the transmit fifo
-          as fast as we can fill it.
+      HWREG(a->ssi_base + SSI_O_DR) = 0;
+      --remain_tx;
+    } while (remain_tx > 0 && remain_tx + 8 > remain_rx);
+    a->remain_tx_bytes = remain_tx;
+    if (remain_tx == 0)
+    {
+      /*
+        The entire length of the packet to be received has been queued.
+        Switch over to get the next interrupt only at the very end of the
+        transfer.
 
-          At this point we know the SSI transmit fifo has at most 7 elements;
-          if we empty the receive fifo, then there is sure to be room for
-          those 7 elements + one more that we put in.
-        */
-        nrf_async_rcv_grab_rx_bytes(a);
-        HWREG(a->ssi_base + SSI_O_DR) = 0;
-        --remain;
-        if (remain == 0)
-        {
-          /*
-            Now that we have put all bytes into the fifo, change to get an
-            interrupt when everything has been transmitted.
-
-            Note that we will check for this condition below, to avoid a race
-            when the transfer completes in the middle of executing this code.
-          */
-          HWREG(a->ssi_base + SSI_O_CR1) |= SSI_CR1_EOT;
-          HWREG(a->ssi_base + SSI_O_IM) |= SSI_TXFF;
-          break;
-        }
-      } while (HWREG(a->ssi_base + SSI_O_SR) & SSI_SR_TNF);
-      a->remain_tx_bytes = remain;
+        Note that we fall through to test for end-of-transmission already in
+        this interrupt invocation, so that we do not risk loosing the event
+        if we happen to get slow and SSI already completed the transfer.
+      */
+      HWREG(a->ssi_base + SSI_O_CR1) |= SSI_CR1_EOT;
+      HWREG(a->ssi_base + SSI_O_IM) |= SSI_TXFF;
     }
   }
 
-  if (remain == 0 && !ROM_SSIBusy(a->ssi_base))
+  if (remain_tx == 0 && !ROM_SSIBusy(a->ssi_base))
   {
     /*
       Now that the transfer is completely done, set the TX interrupt back
@@ -1002,6 +1015,159 @@ resched:
 
 
 /*
+  Continously receive packets on nRF24L01+ in receiver mode.
+
+  As packets are received, they are passed to a callback function. This
+  callback is invoked from interrupt context, so it should ideally be fairly
+  quick and has to be aware of the general interrupt caveats.
+
+  Operation is purely interrupt-driven, without using uDMA; this complies with
+  the Tiva errata that says that SSI0 and SSI1 cannot both use uDMA at the
+  same time.
+*/
+struct nrf_async_receive_multi {
+  void (*consumepacket)(uint8_t *, void *);
+  void *cb_data;
+  uint32_t ssi_base;
+  uint32_t csn_base, csn_pin;
+  uint32_t ce_base, ce_pin;
+  uint32_t irq_base, irq_pin;
+  union {
+    struct nrf_async_rcv rcv;
+    struct nrf_async_cmd cmd;
+  } substate;
+  uint8_t packet[32];
+  uint8_t nrf_rcv_running;
+  uint8_t nrf_cmd_running;
+  uint8_t recvbuf[2];
+  uint8_t state;
+};
+enum nrf_async_receive_multi_states {
+  ST_NRF_ARM_A1,
+  ST_NRF_ARM_A2,
+  ST_NRF_ARM_A3,
+  ST_NRF_ARM_A4
+};
+
+static int32_t
+nrf_async_receive_multi_cont(struct nrf_async_receive_multi *a,
+                             uint32_t is_ssi_event);
+static int32_t
+nrf_async_receive_multi_start(struct nrf_async_receive_multi *a,
+                              void (*consumepacket)(uint8_t *, void *),
+                              void *cb_data, uint32_t ssi_base,
+                               uint32_t csn_base, uint32_t csn_pin,
+                               uint32_t ce_base, uint32_t ce_pin,
+                               uint32_t irq_base, uint32_t irq_pin)
+{
+  a->consumepacket = consumepacket;
+  a->cb_data = cb_data;
+  a->ssi_base = ssi_base;
+  a->csn_base = csn_base;
+  a->csn_pin = csn_pin;
+  a->ce_base = ce_base;
+  a->ce_pin = ce_pin;
+  a->irq_base = irq_base;
+  a->irq_pin = irq_pin;
+  a->nrf_rcv_running = 0;
+  a->nrf_cmd_running = 0;
+  a->state = ST_NRF_ARM_A1;
+
+  /* Assert CE to enter receive mode. */
+  ce_high(ce_base, ce_pin);
+
+  /*
+    Enable interrupt when the IRQ line goes low, which happens when data is
+    ready in the Rx FIFO (RX_DR).
+  */
+  ROM_GPIOPinIntEnable(irq_base, irq_pin);
+  return 0;
+}
+
+
+/*
+  Called to continue a multi-packet receive session.
+  This should be called when an event occurs, either in the form of
+  an SSI interrupt or in the form of a GPIO interrupt on the nRF24L01+
+  IRQ pin (the is_ssi_event flag tells which).
+
+  The two interrupts should be configured to have the same priority, so that
+  one of them does not attempt to pre-empt the other; that would lead to
+  nasty races.
+*/
+static int32_t
+nrf_async_receive_multi_cont(struct nrf_async_receive_multi *a,
+                             uint32_t is_ssi_event)
+{
+  if (is_ssi_event && a->nrf_rcv_running)
+  {
+    if (nrf_async_rcv_cont(&a->substate.rcv))
+      a->nrf_rcv_running = 0;
+    else
+      return 0;
+  }
+  else if (is_ssi_event && a->nrf_cmd_running)
+  {
+    if (nrf_async_cmd_cont(&a->substate.cmd))
+      a->nrf_cmd_running = 0;
+    else
+      return 0;
+  }
+
+resched:
+  switch (a->state)
+  {
+  case ST_NRF_ARM_A1:
+    ROM_GPIOPinIntDisable(a->irq_base, a->irq_pin);
+    /* Clear the RX_DS interrupt. */
+    a->nrf_cmd_running = 1;
+    nrf_write_reg_start(&a->substate.cmd, nRF_STATUS, nRF_RX_DR, a->recvbuf,
+                        a->ssi_base, a->csn_base, a->csn_pin);
+    a->state = ST_NRF_ARM_A2;
+    return 0;
+
+  case ST_NRF_ARM_A2:
+    /* Read FIFO status to check if there is any data ready. */
+    a->nrf_cmd_running = 1;
+    nrf_read_reg_start(&a->substate.cmd, nRF_FIFO_STATUS, a->recvbuf,
+                       a->ssi_base, a->csn_base, a->csn_pin);
+    a->state = ST_NRF_ARM_A3;
+    return 0;
+
+  case ST_NRF_ARM_A3:
+    if (a->recvbuf[1] & nRF_RX_EMPTY)
+    {
+      /*
+        No more packets in the Rx fifo. Enable the IRQ interrupt and wait for
+        more packets to arrive.
+      */
+      a->state = ST_NRF_ARM_A1;
+      ROM_GPIOPinIntEnable(a->irq_base, a->irq_pin);
+      return 0;
+    }
+
+    /* The Rx FIFO is non-empty, so read a packet. */
+    a->nrf_rcv_running = 1;
+    nrf_async_rcv_start(&a->substate.rcv, a->recvbuf, a->packet, 32,
+                        a->ssi_base, a->csn_base, a->csn_pin);
+    a->state = ST_NRF_ARM_A4;
+    return 0;
+
+  case ST_NRF_ARM_A4:
+    /* Deliver the received packet to the callback. */
+    (*(a->consumepacket))(a->packet, a->cb_data);
+    /* Now go check if there are more packets available. */
+    a->state = ST_NRF_ARM_A2;
+    goto resched;
+
+  default:
+    /* This shouldn't really happen ... */
+    return 0;
+  }
+}
+
+
+/*
   Configure nRF24L01+ as Rx or Tx.
     channel - radio frequency channel to use, 0 <= channel <= 127.
     power - nRF_RF_PWR_<X>DBM, <X> is 0, 6, 12, 18 dBm.
@@ -1070,6 +1236,7 @@ config_interrupts(void)
 
 static struct nrf_async_transmit_multi transmit_multi_state;
 static volatile uint8_t transmit_multi_running = 0;
+
 void
 IntHandlerGPIOa(void)
 {
@@ -1096,6 +1263,9 @@ IntHandlerGPIOa(void)
 }
 
 
+static struct nrf_async_receive_multi receive_multi_state;
+static volatile uint8_t receive_multi_running = 0;
+
 void
 IntHandlerGPIOf(void)
 {
@@ -1103,15 +1273,22 @@ IntHandlerGPIOf(void)
   if (irq_status & GPIO_PIN_4)
   {
     /* Rx IRQ. */
+    if (receive_multi_running)
+    {
+      if (nrf_async_receive_multi_cont(&receive_multi_state, 0))
+        transmit_multi_running = 0;
+    }
+    else
+    {
+      /*
+        Clear the interrupt request and disable further interrupts until we can
+        clear the request from the device over SPI.
+      */
+      HWREG(GPIO_PORTF_BASE + GPIO_O_IM) &= ~GPIO_PIN_4 & 0xff;
+      HWREG(GPIO_PORTF_BASE + GPIO_O_ICR) = GPIO_PIN_4;
 
-    /*
-      Clear the interrupt request and disable further interrupts until we can
-      clear the request from the device over SPI.
-    */
-    HWREG(GPIO_PORTF_BASE + GPIO_O_IM) &= ~GPIO_PIN_4 & 0xff;
-    HWREG(GPIO_PORTF_BASE + GPIO_O_ICR) = GPIO_PIN_4;
-
-    serial_output_str("Rx: IRQ: RX_DR\r\n");
+      serial_output_str("Rx: IRQ: RX_DR (spurious)\r\n");
+    }
   }
 }
 
@@ -1134,14 +1311,12 @@ IntHandlerSSI0(void)
 }
 
 
-static struct nrf_async_rcv nrf_rcv_state;
-volatile uint8_t nrf_rcv_running = 0;
-
 void
 IntHandlerSSI1(void)
 {
-  if (nrf_rcv_running && nrf_async_rcv_cont(&nrf_rcv_state))
-    nrf_rcv_running = 0;
+  if (receive_multi_running &&
+      nrf_async_receive_multi_cont(&receive_multi_state, 1))
+    receive_multi_running = 0;
 }
 
 
@@ -1196,15 +1371,20 @@ my_fill_packet(uint8_t *buf, void *d)
 }
 
 
+static uint8_t last_startval;
+static uint8_t current_startval;
+
 static void
 transmit_multi_packet_start(uint8_t startval, uint32_t count,
                             uint32_t ssi_base, uint32_t csn_base, uint32_t csn_pin,
                             uint32_t ce_base, uint32_t ce_pin,
                             uint32_t irq_base, uint32_t irq_pin)
 {
+  current_startval = startval;
+  last_startval = (uint8_t)(startval-1);
   transmit_multi_running = 1;
   nrf_async_transmit_multi_start(&transmit_multi_state, my_fill_packet,
-                                 &startval, count, ssi_base,
+                                 &current_startval, count, ssi_base,
                                  UDMA_CHANNEL_SSI0RX, UDMA_CHANNEL_SSI0TX,
                                  csn_base, csn_pin, ce_base, ce_pin,
                                  irq_base, irq_pin);
@@ -1218,47 +1398,37 @@ transmit_multi_packet_wait(void)
 }
 
 
+static volatile uint32_t packets_received_count = 0;
+static volatile uint32_t packets_lost_count = 0;
+static volatile uint32_t packets_corrupt_count = 0;
+
 static void
-receive_packets(uint32_t count, uint32_t ssi_base, uint32_t csn_base,
-                uint32_t csn_pin, uint32_t ce_base, uint32_t ce_pin)
+my_recv_cb(uint8_t *packet, void *data)
 {
-  uint8_t buf[32];
-  uint8_t val, status;
+  uint32_t i;
+  ++packets_received_count;
+  packets_lost_count += (uint8_t)(packet[0] - last_startval - 1);
+  last_startval = packet[0];
 
-  for (;;)
+  for (i = 1; i < 32; ++i)
   {
-    while (ROM_GPIOPinRead(GPIO_PORTF_BASE, GPIO_PIN_4))
-      ;
-
-    for (;;)
+    if (packet[i] != (uint8_t)(packet[i-1]+1))
     {
-      val = nrf_read_reg(nRF_FIFO_STATUS, &status,
-                         SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3);
-      if (val & nRF_RX_EMPTY)
-        break;
-
-      nrf_rcv_running = 1;
-      nrf_async_rcv_start(&nrf_rcv_state, &status, buf, 32,
-                          ssi_base, csn_base, csn_pin);
-      while (nrf_rcv_running)
-        ;
-      nrf_write_reg(nRF_STATUS, nRF_RX_DR, ssi_base, csn_base, csn_pin);
-
-      if (count <= 1)
-      {
-#if 0
-        uint32_t i;
-        /* Blocking serial output here messes up time measurement. */
-        serial_output_str("Rx last packet: ");
-        for (i = 0; i < 32; ++i)
-          serial_output_hexbyte(buf[i]);
-        serial_output_str("\r\n");
-#endif
-        return;
-      }
-      --count;
+      ++packets_corrupt_count;
+      break;
     }
   }
+}
+
+
+static void
+start_receive_packets(uint32_t ssi_base, uint32_t csn_base,
+                      uint32_t csn_pin, uint32_t ce_base, uint32_t ce_pin)
+{
+  receive_multi_running = 1;
+  nrf_async_receive_multi_start(&receive_multi_state, my_recv_cb, NULL,
+                                ssi_base, csn_base, csn_pin, ce_base, ce_pin,
+                                GPIO_PORTF_BASE, GPIO_PIN_4);
 }
 
 
@@ -1291,6 +1461,7 @@ int main()
   uint8_t status;
   uint8_t val;
   uint32_t start, delta;
+  uint32_t last_received_count, last_lost_count, last_corrupt_count;
 
   /* Use the full 80MHz system clock. */
   ROM_SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL |
@@ -1345,24 +1516,45 @@ int main()
   /* Wait a bit to make sure Rx is ready. */
   ROM_SysCtlDelay(MCU_HZ/3/100);
 
-//  transmit_packet(42, SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3,
-//                  GPIO_PORTA_BASE, GPIO_PIN_6);
   serial_output_str("Start timer...\r\n");
   start = get_time();
   transmit_multi_packet_start(42, 24, SSI0_BASE, GPIO_PORTA_BASE, GPIO_PIN_3,
                               GPIO_PORTA_BASE, GPIO_PIN_6,
                               GPIO_PORTA_BASE, GPIO_PIN_7);
-  //serial_output_str("Tx: Sent packet\r\n");
 
-  //serial_output_str("Rx: Waiting for packet...\r\n");
-  receive_packets(24, SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3,
-                  GPIO_PORTB_BASE, GPIO_PIN_0);
-  transmit_multi_packet_wait();
+  last_received_count = packets_received_count;
+  last_lost_count = packets_lost_count;
+  last_corrupt_count = packets_corrupt_count;
+  start_receive_packets(SSI1_BASE, GPIO_PORTF_BASE, GPIO_PIN_3,
+                        GPIO_PORTB_BASE, GPIO_PIN_0);
   delta = calc_time(start);
-  serial_output_str("Stop timer\r\n");
-  serial_output_str("Tx: transmit done, total usec=");
+  serial_output_str("Total usec=");
   println_uint32(delta/(MCU_HZ/1000000));
 
   for(;;)
+  {
+    uint32_t received_count = packets_received_count;
+    uint32_t lost_count = packets_lost_count;
+    uint32_t corrupt_count = packets_corrupt_count;
+    if (received_count != last_received_count ||
+        lost_count != last_lost_count ||
+        corrupt_count != last_corrupt_count)
+    {
+      delta = calc_time(start);
+      serial_output_str("Rx: ");
+      println_uint32(received_count);
+      println_uint32(lost_count);
+      println_uint32(corrupt_count);
+      serial_output_str("usec=");
+      println_uint32(delta/(MCU_HZ/1000000));
+      last_received_count = received_count;
+      last_lost_count = lost_count;
+      last_corrupt_count = corrupt_count;
+    }
+  }
+  transmit_multi_packet_wait();
+
+  serial_output_str("Done!\r\n");
+  for (;;)
     ;
 }
